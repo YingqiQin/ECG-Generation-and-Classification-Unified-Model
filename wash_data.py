@@ -1,23 +1,32 @@
-import re
+import numpy as np
 import pandas as pd
+import re
 
-def normalize_patient_id(x):
-    if pd.isna(x):
-        return ""
-    s = str(x).strip()
+manifest = pd.DataFrame(records)
+manifest_path = out_root / "manifest.csv"
+manifest.to_csv(manifest_path, index=False, encoding="utf-8-sig")
 
-    # 处理类似 "1234567.0"
-    if re.fullmatch(r"\d+\.0+", s):
-        s = s.split(".")[0]
+# 生成干净版：只保留可训练样本
+clean = manifest.copy()
 
-    # 只保留数字
-    digits = re.sub(r"\D", "", s)
+# 1) 必须有 npy
+clean = clean[clean["npy_path"].fillna("") != ""]
 
-    # 你明确说 ID 是 7 位数字：不足则左侧补 0（前提是你确认就是固定7位）
-    if 0 < len(digits) <= 7:
-        digits = digits.zfill(7)
+# 2) 必须 patient_id 合法（严格7位）
+clean = clean[clean["patient_id"].astype(str).str.fullmatch(r"\d{7}", na=False)]
 
-    # 最终只接受严格7位，否则置空
-    return digits if re.fullmatch(r"\d{7}", digits) else ""
+# 3) 去掉 ambiguous（同名对应多个ID 或缺失导致的空ID）
+clean = clean[clean["id_ambiguous"] == 0]
 
-df["ID"] = df["ID"].apply(normalize_patient_id)
+# 4) LVEF 必须有值且是数值
+clean["lvef"] = pd.to_numeric(clean["lvef"], errors="coerce")
+clean = clean[clean["lvef"].notna()]
+
+# （可选）5) 样本长度必须>0
+clean = clean[clean["n_samples"] > 0]
+
+clean_manifest_path = out_root / "manifest_clean.csv"
+clean.to_csv(clean_manifest_path, index=False, encoding="utf-8-sig")
+
+print("clean_manifest:", clean_manifest_path, "rows=", len(clean))
+
