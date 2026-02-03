@@ -2,6 +2,58 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 
+import numpy as np
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score,
+    accuracy_score, precision_recall_fscore_support,
+    confusion_matrix, roc_curve, precision_recall_curve
+)
+
+def compute_binary_metrics_with_curves(y_true, y_prob, threshold=0.5):
+    """
+    y_true: (N,) int {0,1}
+    y_prob: (N,) float in [0,1] for positive class
+    """
+    y_true = np.asarray(y_true).astype(int)
+    y_prob = np.asarray(y_prob).astype(float)
+
+    y_pred = (y_prob >= threshold).astype(int)
+
+    acc = accuracy_score(y_true, y_pred)
+    prec, rec, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="binary", zero_division=0
+    )
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+
+    # Curves only defined if both classes exist
+    if len(np.unique(y_true)) > 1:
+        auroc = roc_auc_score(y_true, y_prob)
+        auprc = average_precision_score(y_true, y_prob)
+
+        fpr, tpr, roc_thr = roc_curve(y_true, y_prob)
+        pr_prec, pr_rec, pr_thr = precision_recall_curve(y_true, y_prob)
+    else:
+        auroc = np.nan
+        auprc = np.nan
+        fpr = tpr = roc_thr = None
+        pr_prec = pr_rec = pr_thr = None
+
+    return {
+        "acc": acc,
+        "precision": prec,
+        "recall": rec,
+        "f1": f1,
+        "auroc": auroc,
+        "auprc": auprc,
+        "threshold": float(threshold),
+        "confusion_matrix": cm,
+        "n": int(len(y_true)),
+        "curves": {
+            "roc": {"fpr": fpr, "tpr": tpr, "thr": roc_thr},
+            "pr": {"precision": pr_prec, "recall": pr_rec, "thr": pr_thr},
+        }
+    }
+
 def plot_roc(metrics, title="ROC", save_path=None):
     roc = metrics["curves"]["roc"]
     if roc["fpr"] is None:
