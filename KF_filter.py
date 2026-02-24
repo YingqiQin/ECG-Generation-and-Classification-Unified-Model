@@ -272,6 +272,13 @@ def calibrate_csv(
     out_frames = []
     all_metrics = []
 
+    pooled = {
+        "err_raw_s": [],
+        "err_raw_d": [],
+        "err_kf_s": [],
+        "err_kf_d": [],
+    }
+
     for pid, g in df.groupby("id_clean", sort=False):
         g = g.copy().reset_index(drop=True)
 
@@ -313,6 +320,11 @@ def calibrate_csv(
         err_kf_s  = (g.loc[eval_mask, "y_kf_sbp"]   - g.loc[eval_mask, "y_true_sbp"]).to_numpy(float)
         err_kf_d  = (g.loc[eval_mask, "y_kf_dbp"]   - g.loc[eval_mask, "y_true_dbp"]).to_numpy(float)
 
+        pooled["err_raw_s"].append(err_raw_s)
+        pooled["err_raw_d"].append(err_raw_d)
+        pooled["err_kf_s"].append(err_kf_s)
+        pooled["err_kf_d"].append(err_kf_d)
+
         m_raw_s = me_std_mae(err_raw_s); m_raw_d = me_std_mae(err_raw_d)
         m_kf_s  = me_std_mae(err_kf_s);  m_kf_d  = me_std_mae(err_kf_d)
 
@@ -332,9 +344,29 @@ def calibrate_csv(
     df_out.to_csv(out_csv, index=False)
 
     met = pd.DataFrame(all_metrics)
+    err_raw_s_all = np.concatenate(pooled["err_raw_s"]) if len(pooled["err_raw_s"]) else np.array([])
+    err_raw_d_all = np.concatenate(pooled["err_raw_d"]) if len(pooled["err_raw_d"]) else np.array([])
+    err_kf_s_all = np.concatenate(pooled["err_kf_s"]) if len(pooled["err_kf_s"]) else np.array([])
+    err_kf_d_all = np.concatenate(pooled["err_kf_d"]) if len(pooled["err_kf_d"]) else np.array([])
+
+    micro = {
+        "RAW_SBP_ME": me_std_mae(err_raw_s_all)[0],
+        "RAW_SBP_SD": me_std_mae(err_raw_s_all)[1],
+        "RAW_SBP_MAE": me_std_mae(err_raw_s_all)[2],
+        "RAW_DBP_ME": me_std_mae(err_raw_d_all)[0],
+        "RAW_DBP_SD": me_std_mae(err_raw_d_all)[1],
+        "RAW_DBP_MAE": me_std_mae(err_raw_d_all)[2],
+        "KF_SBP_ME": me_std_mae(err_kf_s_all)[0],
+        "KF_SBP_SD": me_std_mae(err_kf_s_all)[1],
+        "KF_SBP_MAE": me_std_mae(err_kf_s_all)[2],
+        "KF_DBP_ME": me_std_mae(err_kf_d_all)[0],
+        "KF_DBP_SD": me_std_mae(err_kf_d_all)[1],
+        "KF_DBP_MAE": me_std_mae(err_kf_d_all)[2],
+        "N_EVAL_POINTS": int(err_kf_s_all.shape[0]),
+    }
     # macro average over ids (simple mean)
     macro = met.drop(columns=["id_clean"]).mean(numeric_only=True).to_dict()
-    return df_out, met, macro
+    return df_out, met, {"macro": macro, "micro": micro}
 
 
 # -----------------------------
