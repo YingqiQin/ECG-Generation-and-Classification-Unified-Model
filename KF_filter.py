@@ -93,7 +93,7 @@ class KalmanAffineCalibrator2DTime:
 # -----------------------------
 def infer_ts_column(df: pd.DataFrame):
     # common candidates
-    cands = ["timestamp", "ts", "time", "datetime", "date_time", "record_time"]
+    cands = ["t_bp_ms", "timestamp", "ts", "time", "datetime", "date_time", "record_time"]
     for c in cands:
         if c in df.columns:
             return c
