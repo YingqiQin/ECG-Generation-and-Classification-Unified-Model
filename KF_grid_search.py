@@ -3,101 +3,40 @@ import pandas as pd
 from itertools import product
 
 # -----------------------------
-# KF calibrator (time-aware), identity init
-# theta = [a_s, b_s, a_d, b_d]
+# Utils
 # -----------------------------
-class KalmanAffineCalibrator2DTime:
-    def __init__(
-        self,
-        mu0=None,
-        P0=None,
-        Q_per_hour=None,
-        R=None,
-        huber_delta=20.0,
-        max_abs_innov=250.0,
-    ):
-        if mu0 is None:
-            mu0 = np.array([1.0, 0.0, 1.0, 0.0], dtype=float)
-        self.mu = np.asarray(mu0, float).copy()
+def me_sd_mae(err):
+    err = np.asarray(err, float)
+    return float(err.mean()), float(err.std(ddof=0)), float(np.mean(np.abs(err)))
 
-        if P0 is None:
-            P0 = np.diag([0.5**2, 30.0**2, 0.5**2, 30.0**2])
-        self.P = np.asarray(P0, float).copy()
+def ridge_fit_affine(yhat, ytrue, lam=1e-2, fit_intercept=True):
+    """
+    Fit ytrue ≈ a*yhat + b with ridge.
+    Returns (a,b).
+    """
+    yhat = np.asarray(yhat, float).reshape(-1, 1)
+    ytrue = np.asarray(ytrue, float).reshape(-1, 1)
+    if fit_intercept:
+        X = np.concatenate([yhat, np.ones_like(yhat)], axis=1)  # [n,2]
+    else:
+        X = yhat
 
-        if Q_per_hour is None:
-            Q_per_hour = np.diag([0.0, 1e-3, 0.0, 1e-3])
-        self.Q_per_hour = np.asarray(Q_per_hour, float).copy()
+    I = np.eye(X.shape[1], dtype=float)
+    theta = np.linalg.solve(X.T @ X + lam * I, X.T @ ytrue)     # [2,1]
+    if fit_intercept:
+        a, b = float(theta[0, 0]), float(theta[1, 0])
+        return a, b
+    else:
+        a = float(theta[0, 0])
+        return a, 0.0
 
-        if R is None:
-            R = np.diag([4.0**2, 4.0**2])
-        self.R = np.asarray(R, float).copy()
-
-        self.huber_delta = float(huber_delta)
-        self.max_abs_innov = float(max_abs_innov)
-        self.last_ts = None
-
-    @staticmethod
-    def X_from_yhat(yhat):
-        sh, dh = float(yhat[0]), float(yhat[1])
-        return np.array([[sh, 1.0, 0.0, 0.0],
-                         [0.0, 0.0, dh, 1.0]], dtype=float)
-
-    def _predict_theta(self, ts_sec):
-        if self.last_ts is None:
-            self.last_ts = ts_sec
-            return 0.0
-        dt_hours = max((ts_sec - self.last_ts) / 3600.0, 0.0)
-        self.P = self.P + self.Q_per_hour * dt_hours
-        self.last_ts = ts_sec
-        return dt_hours
-
-    def predict(self, yhat, ts_sec):
-        self._predict_theta(ts_sec)
-        X = self.X_from_yhat(yhat)
-        y_pred = X @ self.mu
-        S = X @ self.P @ X.T + self.R
-        std = np.sqrt(np.maximum(np.diag(S), 1e-12))
-        return y_pred, std
-
-    def update_with_cuff(self, yhat, y_true, ts_sec):
-        self._predict_theta(ts_sec)
-        X = self.X_from_yhat(yhat)
-        y_true = np.asarray(y_true, float).reshape(2)
-
-        y_pred = X @ self.mu
-        innov = y_true - y_pred
-
-        # extreme guard
-        if np.any(np.abs(innov) > self.max_abs_innov):
-            return innov, True
-
-        # Huber-like robustification: large innov => downweight by inflating R
-        R_eff = self.R.copy()
-        if self.huber_delta is not None:
-            norm = float(np.linalg.norm(innov))
-            if norm > self.huber_delta:
-                scale = self.huber_delta / (norm + 1e-12)
-                R_eff = R_eff / (scale**2 + 1e-12)
-
-        S = X @ self.P @ X.T + R_eff
-        K = self.P @ X.T @ np.linalg.inv(S)
-
-        self.mu = self.mu + K @ innov
-        self.P = (np.eye(4) - K @ X) @ self.P
-        return innov, False
-
-
-# -----------------------------
-# calibration point selector (deterministic)
-# Default: try 4 awake + 3 sleep with >=180min gap.
-# If not enough, fill from remaining points while keeping gap.
-# If still not enough, relax min_gap progressively.
-# -----------------------------
 def select_calib_indices(df_id, ts_sec, n_total=7, n_awake=4, n_sleep=3, min_gap_min=180):
+    """
+    Deterministic selector. To ensure fair tuning, we guarantee n_total points by progressively relaxing min_gap.
+    """
     sleep = df_id["sleep"].to_numpy().astype(int)
     idx_all = np.arange(len(df_id))
 
-    # progressive relaxation on gap to guarantee 7 points (for fair tuning)
     gap_list = [min_gap_min, 150, 120, 90, 60, 30, 0]
     for gap_min in gap_list:
         min_gap = gap_min * 60
@@ -108,14 +47,12 @@ def select_calib_indices(df_id, ts_sec, n_total=7, n_awake=4, n_sleep=3, min_gap
         idx_awake = idx_all[sleep == 0]
         idx_sleep = idx_all[sleep == 1]
 
-        # choose evenly spaced targets within each pool
         def pick_evenly(idx_pool, n_pick):
             if n_pick <= 0 or len(idx_pool) == 0:
                 return []
             if len(idx_pool) <= n_pick:
                 return list(idx_pool)
-            pool_ts = ts_sec[idx_pool]
-            order = np.argsort(pool_ts)
+            order = np.argsort(ts_sec[idx_pool])
             idx_sorted = idx_pool[order]
             targets = np.linspace(0, len(idx_sorted)-1, n_pick).round().astype(int)
             return [int(idx_sorted[t]) for t in targets]
@@ -128,7 +65,6 @@ def select_calib_indices(df_id, ts_sec, n_total=7, n_awake=4, n_sleep=3, min_gap
             if ok(i, picked):
                 picked.append(i)
 
-        # fill remaining (prefer awake then sleep then all)
         def fill(pool):
             nonlocal picked
             for i in sorted(pool, key=lambda x: ts_sec[x]):
@@ -139,202 +75,345 @@ def select_calib_indices(df_id, ts_sec, n_total=7, n_awake=4, n_sleep=3, min_gap
                     if len(picked) >= n_total:
                         break
 
-        fill(idx_awake)
-        fill(idx_sleep)
-        fill(idx_all)
+        fill(idx_awake); fill(idx_sleep); fill(idx_all)
 
         if len(picked) >= n_total:
             picked = sorted(picked[:n_total], key=lambda i: ts_sec[i])
             return np.array(picked, dtype=int)
 
-    # fallback
     return np.array(sorted(idx_all[:min(n_total, len(idx_all))]), dtype=int)
 
 
-def me_sd_mae(err):
-    err = np.asarray(err, float)
-    return float(err.mean()), float(err.std(ddof=0)), float(np.mean(np.abs(err)))
+# -----------------------------
+# Layer-2: Kalman filter tracking ONLY offsets b_s(t), b_d(t)
+# z_t = y_true - a*yhat  = b(t) + noise
+# state: b = [b_s, b_d]
+# -----------------------------
+class OffsetKalman2DTime:
+    def __init__(self, b0, P0, Qb_per_hour, R, huber_delta=20.0, max_abs_innov=250.0):
+        self.b = np.asarray(b0, float).reshape(2)               # [2]
+        self.P = np.asarray(P0, float).copy()                   # [2,2]
+        self.Qb_per_hour = np.asarray(Qb_per_hour, float).copy()# [2,2]
+        self.R = np.asarray(R, float).copy()                    # [2,2]
+        self.huber_delta = float(huber_delta)
+        self.max_abs_innov = float(max_abs_innov)
+        self.last_ts = None
+
+    def _predict(self, ts_sec):
+        if self.last_ts is None:
+            self.last_ts = ts_sec
+            return 0.0
+        dt_hours = max((ts_sec - self.last_ts) / 3600.0, 0.0)
+        self.P = self.P + self.Qb_per_hour * dt_hours
+        self.last_ts = ts_sec
+        return dt_hours
+
+    def predict_b(self, ts_sec):
+        self._predict(ts_sec)
+        return self.b.copy(), self.P.copy()
+
+    def update(self, z_obs, ts_sec):
+        """
+        z_obs: observed offset = y_true - a*yhat, shape (2,)
+        """
+        self._predict(ts_sec)
+        z_obs = np.asarray(z_obs, float).reshape(2)
+
+        innov = z_obs - self.b  # H=I
+        if np.any(np.abs(innov) > self.max_abs_innov):
+            return innov, True
+
+        R_eff = self.R.copy()
+        if self.huber_delta is not None:
+            norm = float(np.linalg.norm(innov))
+            if norm > self.huber_delta:
+                scale = self.huber_delta / (norm + 1e-12)
+                R_eff = R_eff / (scale**2 + 1e-12)
+
+        S = self.P + R_eff
+        K = self.P @ np.linalg.inv(S)
+        self.b = self.b + K @ innov
+        self.P = (np.eye(2) - K) @ self.P
+        return innov, False
 
 
 # -----------------------------
-# Evaluate one parameter set on val CSV
-# Returns micro + macro + diagnostics
+# Run two-layer calibration on ONE id
 # -----------------------------
-def eval_params_on_val(
-    val_csv_path: str,
-    qa: float,
-    qb: float,
+def run_two_layer_one_id(
+    g: pd.DataFrame,
+    calib_idx: np.ndarray,
+    lam_ridge: float,
+    Qb_per_hour_diag: tuple[float, float],
     sigma_R: float,
-    sigma_a0: float,
+    sigma_b0: float,
+    huber_delta: float,
+    clip_a: tuple[float, float] | None = None,  # e.g., (0, 3) if you want monotonic
+):
+    # sort by time
+    ts_sec = (g["t_bp_ms"].to_numpy(np.int64) // 1000)
+    order = np.argsort(ts_sec)
+    g = g.iloc[order].reset_index(drop=True)
+    ts_sec = ts_sec[order]
+
+    # rebuild calib mask after sorting
+    calib_mask = np.zeros(len(g), dtype=bool)
+    # NOTE: calib_idx should be indices AFTER sorting, so we compute it outside using the sorted g/ts
+    calib_mask[calib_idx] = True
+
+    yhat = g[["y_pred_sbp", "y_pred_dbp"]].to_numpy(float)
+    ytrue = g[["y_true_sbp", "y_true_dbp"]].to_numpy(float)
+
+    # -------- Layer-1: day-level ridge affine on calib points --------
+    idx = calib_idx
+    a_s, b_s0 = ridge_fit_affine(yhat[idx, 0], ytrue[idx, 0], lam=lam_ridge)
+    a_d, b_d0 = ridge_fit_affine(yhat[idx, 1], ytrue[idx, 1], lam=lam_ridge)
+
+    if clip_a is not None:
+        a_s = float(np.clip(a_s, clip_a[0], clip_a[1]))
+        a_d = float(np.clip(a_d, clip_a[0], clip_a[1]))
+
+    # initial offset state uses ridge intercepts
+    b0 = np.array([b_s0, b_d0], float)
+    P0 = np.diag([sigma_b0**2, sigma_b0**2]).astype(float)
+    Qb = np.diag([Qb_per_hour_diag[0], Qb_per_hour_diag[1]]).astype(float)
+    R = np.diag([sigma_R**2, sigma_R**2]).astype(float)
+
+    kf = OffsetKalman2DTime(b0=b0, P0=P0, Qb_per_hour=Qb, R=R, huber_delta=huber_delta)
+
+    # outputs
+    y_cal = np.zeros_like(yhat)
+    b_track = np.zeros((len(g), 2), float)
+    innov = np.full((len(g), 2), np.nan, float)
+    skipped = np.zeros(len(g), bool)
+
+    for i in range(len(g)):
+        # predict calibrated BP
+        b_i, _ = kf.predict_b(int(ts_sec[i]))
+        b_track[i] = b_i
+        y_cal[i, 0] = a_s * yhat[i, 0] + b_i[0]
+        y_cal[i, 1] = a_d * yhat[i, 1] + b_i[1]
+
+        if calib_mask[i]:
+            z_obs = np.array([ytrue[i, 0] - a_s * yhat[i, 0],
+                              ytrue[i, 1] - a_d * yhat[i, 1]], float)
+            inn, sk = kf.update(z_obs, int(ts_sec[i]))
+            innov[i] = inn
+            skipped[i] = sk
+
+    return {
+        "g_sorted": g,
+        "order": order,
+        "ts_sec": ts_sec,
+        "calib_mask": calib_mask,
+        "y_cal": y_cal,
+        "a_s": a_s, "a_d": a_d,
+        "b0_s": b_s0, "b0_d": b_d0,
+        "b_track": b_track,
+        "innov": innov,
+        "skipped": skipped,
+    }
+
+def run_static_ridge_one_id(g_sorted, calib_idx, lam_ridge, clip_a=None):
+    ts_sec = (g_sorted["t_bp_ms"].to_numpy(np.int64) // 1000)
+    yhat = g_sorted[["y_pred_sbp", "y_pred_dbp"]].to_numpy(float)
+    ytrue= g_sorted[["y_true_sbp", "y_true_dbp"]].to_numpy(float)
+
+    idx = calib_idx
+    a_s, b_s = ridge_fit_affine(yhat[idx,0], ytrue[idx,0], lam=lam_ridge)
+    a_d, b_d = ridge_fit_affine(yhat[idx,1], ytrue[idx,1], lam=lam_ridge)
+
+    if clip_a is not None:
+        a_s = float(np.clip(a_s, clip_a[0], clip_a[1]))
+        a_d = float(np.clip(a_d, clip_a[0], clip_a[1]))
+
+    y_cal = np.zeros_like(yhat)
+    y_cal[:,0] = a_s * yhat[:,0] + b_s
+    y_cal[:,1] = a_d * yhat[:,1] + b_d
+    return y_cal, (a_s,b_s,a_d,b_d)
+
+def eval_params_two_layer_on_val(
+    val_csv_path: str,
+    lam_ridge: float,
+    qb_s: float,
+    qb_d: float,
+    sigma_R: float,
     sigma_b0: float,
     huber_delta: float,
     n_awake=4,
     n_sleep=3,
     min_gap_min=180,
-    lambda_me=1.0,
+    clip_a=None,
 ):
     df = pd.read_csv(val_csv_path)
-
     required = ["id_clean","t_bp_ms","sleep","y_true_sbp","y_true_dbp","y_pred_sbp","y_pred_dbp"]
     miss = [c for c in required if c not in df.columns]
     if miss:
         raise ValueError(f"Missing columns: {miss}")
 
-    pooled = {"raw_s":[], "raw_d":[], "kf_s":[], "kf_d":[]}
+    pooled = {"raw_s":[], "raw_d":[], "static_s":[], "static_d":[], "two_s":[], "two_d":[]}
     per_id_rows = []
-    skip_updates = 0
-    total_updates = 0
 
     for pid, g in df.groupby("id_clean", sort=False):
         g = g.copy()
-
         ts_sec = (g["t_bp_ms"].to_numpy(np.int64) // 1000)
         order = np.argsort(ts_sec)
         g = g.iloc[order].reset_index(drop=True)
         ts_sec = ts_sec[order]
 
         calib_idx = select_calib_indices(
-            g, ts_sec,
-            n_total=7, n_awake=n_awake, n_sleep=n_sleep,
+            g, ts_sec, n_total=7,
+            n_awake=n_awake, n_sleep=n_sleep,
             min_gap_min=min_gap_min
         )
-        calib_mask = np.zeros(len(g), dtype=bool)
-        calib_mask[calib_idx] = True
+        calib_mask = np.zeros(len(g), bool); calib_mask[calib_idx] = True
+        eval_mask = ~calib_mask
 
-        # KF hyperparams
-        Q = np.diag([qa, qb, qa, qb]).astype(float)
-        R = np.diag([sigma_R**2, sigma_R**2]).astype(float)
-        P0 = np.diag([sigma_a0**2, sigma_b0**2, sigma_a0**2, sigma_b0**2]).astype(float)
-
-        kf = KalmanAffineCalibrator2DTime(P0=P0, Q_per_hour=Q, R=R, huber_delta=huber_delta)
-
+        # raw errors
         yhat = g[["y_pred_sbp","y_pred_dbp"]].to_numpy(float)
         ytrue= g[["y_true_sbp","y_true_dbp"]].to_numpy(float)
+        err_raw_s = yhat[eval_mask,0] - ytrue[eval_mask,0]
+        err_raw_d = yhat[eval_mask,1] - ytrue[eval_mask,1]
 
-        ykf = np.zeros_like(yhat)
+        # static ridge baseline
+        y_static, _ = run_static_ridge_one_id(g, calib_idx, lam_ridge=lam_ridge, clip_a=clip_a)
+        err_sta_s = y_static[eval_mask,0] - ytrue[eval_mask,0]
+        err_sta_d = y_static[eval_mask,1] - ytrue[eval_mask,1]
 
-        for i in range(len(g)):
-            pred, _ = kf.predict(yhat[i], int(ts_sec[i]))
-            ykf[i] = pred
+        # two-layer (ridge a + KF b(t))
+        out = run_two_layer_one_id(
+            g=g,
+            calib_idx=calib_idx,
+            lam_ridge=lam_ridge,
+            Qb_per_hour_diag=(qb_s, qb_d),
+            sigma_R=sigma_R,
+            sigma_b0=sigma_b0,
+            huber_delta=huber_delta,
+            clip_a=clip_a
+        )
+        y_two = out["y_cal"]
+        err_two_s = y_two[eval_mask,0] - ytrue[eval_mask,0]
+        err_two_d = y_two[eval_mask,1] - ytrue[eval_mask,1]
 
-            if calib_mask[i]:
-                innov, skipped = kf.update_with_cuff(yhat[i], ytrue[i], int(ts_sec[i]))
-                total_updates += 1
-                if skipped:
-                    skip_updates += 1
-
-        eval_mask = ~calib_mask
-        err_raw_s = (yhat[eval_mask,0] - ytrue[eval_mask,0])
-        err_raw_d = (yhat[eval_mask,1] - ytrue[eval_mask,1])
-        err_kf_s  = (ykf[eval_mask,0] - ytrue[eval_mask,0])
-        err_kf_d  = (ykf[eval_mask,1] - ytrue[eval_mask,1])
-
+        # accumulate micro
         pooled["raw_s"].append(err_raw_s); pooled["raw_d"].append(err_raw_d)
-        pooled["kf_s"].append(err_kf_s);   pooled["kf_d"].append(err_kf_d)
+        pooled["static_s"].append(err_sta_s); pooled["static_d"].append(err_sta_d)
+        pooled["two_s"].append(err_two_s); pooled["two_d"].append(err_two_d)
 
-        # per-id metrics (macro)
-        r_s = me_sd_mae(err_raw_s); r_d = me_sd_mae(err_raw_d)
-        k_s = me_sd_mae(err_kf_s);  k_d = me_sd_mae(err_kf_d)
+        # per-id macro row
+        raw_s = me_sd_mae(err_raw_s); raw_d = me_sd_mae(err_raw_d)
+        sta_s = me_sd_mae(err_sta_s); sta_d = me_sd_mae(err_sta_d)
+        two_s = me_sd_mae(err_two_s); two_d = me_sd_mae(err_two_d)
 
         per_id_rows.append({
             "id_clean": pid,
             "n_points": int(len(g)),
-            "n_calib": int(calib_mask.sum()),
-            "RAW_SBP_ME": r_s[0], "RAW_SBP_SD": r_s[1], "RAW_SBP_MAE": r_s[2],
-            "RAW_DBP_ME": r_d[0], "RAW_DBP_SD": r_d[1], "RAW_DBP_MAE": r_d[2],
-            "KF_SBP_ME":  k_s[0], "KF_SBP_SD":  k_s[1], "KF_SBP_MAE":  k_s[2],
-            "KF_DBP_ME":  k_d[0], "KF_DBP_SD":  k_d[1], "KF_DBP_MAE":  k_d[2],
+            "RAW_SBP_ME": raw_s[0], "RAW_SBP_SD": raw_s[1], "RAW_SBP_MAE": raw_s[2],
+            "RAW_DBP_ME": raw_d[0], "RAW_DBP_SD": raw_d[1], "RAW_DBP_MAE": raw_d[2],
+            "STA_SBP_ME": sta_s[0], "STA_SBP_SD": sta_s[1], "STA_SBP_MAE": sta_s[2],
+            "STA_DBP_ME": sta_d[0], "STA_DBP_SD": sta_d[1], "STA_DBP_MAE": sta_d[2],
+            "TWO_SBP_ME": two_s[0], "TWO_SBP_SD": two_s[1], "TWO_SBP_MAE": two_s[2],
+            "TWO_DBP_ME": two_d[0], "TWO_DBP_SD": two_d[1], "TWO_DBP_MAE": two_d[2],
+            "a_s": out["a_s"], "a_d": out["a_d"],
         })
 
     # micro pooled
-    err_raw_s_all = np.concatenate(pooled["raw_s"]) if pooled["raw_s"] else np.array([])
-    err_raw_d_all = np.concatenate(pooled["raw_d"]) if pooled["raw_d"] else np.array([])
-    err_kf_s_all  = np.concatenate(pooled["kf_s"])  if pooled["kf_s"]  else np.array([])
-    err_kf_d_all  = np.concatenate(pooled["kf_d"])  if pooled["kf_d"]  else np.array([])
-
-    raw_s = me_sd_mae(err_raw_s_all); raw_d = me_sd_mae(err_raw_d_all)
-    kf_s  = me_sd_mae(err_kf_s_all);  kf_d  = me_sd_mae(err_kf_d_all)
-
-    micro = {
-        "RAW_SBP_ME": raw_s[0], "RAW_SBP_SD": raw_s[1], "RAW_SBP_MAE": raw_s[2],
-        "RAW_DBP_ME": raw_d[0], "RAW_DBP_SD": raw_d[1], "RAW_DBP_MAE": raw_d[2],
-        "KF_SBP_ME":  kf_s[0],  "KF_SBP_SD":  kf_s[1],  "KF_SBP_MAE":  kf_s[2],
-        "KF_DBP_ME":  kf_d[0],  "KF_DBP_SD":  kf_d[1],  "KF_DBP_MAE":  kf_d[2],
-        "N_EVAL_POINTS": int(err_kf_s_all.shape[0]),
-    }
+    def cat(k): return np.concatenate(pooled[k]) if pooled[k] else np.array([])
+    micro = {}
+    for tag in ["raw","static","two"]:
+        e_s = cat(f"{tag}_s"); e_d = cat(f"{tag}_d")
+        m_s = me_sd_mae(e_s);   m_d = me_sd_mae(e_d)
+        micro[f"{tag.upper()}_SBP_ME"] = m_s[0]
+        micro[f"{tag.upper()}_SBP_SD"] = m_s[1]
+        micro[f"{tag.upper()}_SBP_MAE"]= m_s[2]
+        micro[f"{tag.upper()}_DBP_ME"] = m_d[0]
+        micro[f"{tag.upper()}_DBP_SD"] = m_d[1]
+        micro[f"{tag.upper()}_DBP_MAE"]= m_d[2]
+    micro["N_EVAL_POINTS"] = int(cat("two_s").shape[0])
 
     met = pd.DataFrame(per_id_rows)
     macro = met.drop(columns=["id_clean"]).mean(numeric_only=True).to_dict()
 
-    # objective aligned with ME±STD (lower is better)
-    obj = (micro["KF_SBP_SD"] + micro["KF_DBP_SD"]) + lambda_me * (
-        abs(micro["KF_SBP_ME"]) + abs(micro["KF_DBP_ME"])
-    )
-
-    diag = {
-        "skip_update_ratio": (skip_updates / max(total_updates, 1)),
-        "total_updates": int(total_updates),
-    }
-
-    return micro, macro, obj, diag
+    # objective: match your ME±STD preference (lower is better)
+    obj = (micro["TWO_SBP_SD"] + micro["TWO_DBP_SD"]) + 1.0 * (abs(micro["TWO_SBP_ME"]) + abs(micro["TWO_DBP_ME"]))
+    return micro, macro, obj, met
 
 
-# -----------------------------
-# Grid search driver
-# -----------------------------
-def grid_search_kf(val_csv_path: str, out_csv_path: str):
-    # Recommended search space (start moderate)
-    qa_list = [0.0, 1e-7, 1e-6, 1e-5]               # scale drift (often ~0)
-    qb_list = [1e-4, 3e-4, 1e-3, 3e-3, 1e-2, 3e-2]   # offset drift
-    sigma_R_list = [3.0, 4.0, 5.0, 6.0, 8.0]         # cuff noise std (mmHg)
-    sigma_a0_list = [0.2, 0.5, 1.0]                  # initial slope uncertainty
-    sigma_b0_list = [10.0, 20.0, 30.0, 50.0]         # initial offset uncertainty
-    huber_delta_list = [15.0, 20.0, 30.0, 40.0]
+def grid_search_two_layer(val_csv_path: str, out_csv_path: str, use_tqdm=True):
+    lam_list = [0.0, 1e-4, 1e-3, 1e-2, 1e-1, 1.0]
+    qb_list  = [0.0, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3, 1e-2]  # per hour drift for offsets
+    sigma_R_list = [3.0, 4.0, 5.0, 6.0, 8.0]
+    sigma_b0_list = [5.0, 10.0, 20.0, 30.0, 50.0]
+    huber_list = [15.0, 20.0, 30.0, 40.0]
+
+    combos = list(product(lam_list, qb_list, qb_list, sigma_R_list, sigma_b0_list, huber_list))
+
+    # optional: constrain scale monotonic (often sensible). If you want allow negative slopes, set clip_a=None.
+    clip_a = None  # or (0.0, 3.0)
 
     rows = []
     best = None
 
-    for qa, qb, sR, sa0, sb0, hd in product(qa_list, qb_list, sigma_R_list, sigma_a0_list, sigma_b0_list, huber_delta_list):
-        micro, macro, obj, diag = eval_params_on_val(
+    if use_tqdm:
+        try:
+            from tqdm import tqdm
+            it = tqdm(combos, total=len(combos), desc="Two-layer grid", dynamic_ncols=True)
+        except Exception:
+            it = combos
+            use_tqdm = False
+    else:
+        it = combos
+
+    for step, (lam, qb_s, qb_d, sR, sb0, hd) in enumerate(it, 1):
+        micro, macro, obj, _ = eval_params_two_layer_on_val(
             val_csv_path=val_csv_path,
-            qa=qa, qb=qb,
+            lam_ridge=lam,
+            qb_s=qb_s,
+            qb_d=qb_d,
             sigma_R=sR,
-            sigma_a0=sa0, sigma_b0=sb0,
+            sigma_b0=sb0,
             huber_delta=hd,
-            # keep these fixed during tuning (consistent protocol)
             n_awake=4, n_sleep=3, min_gap_min=180,
-            lambda_me=1.0,
+            clip_a=clip_a
         )
 
         row = {
-            "qa": qa, "qb": qb, "sigma_R": sR, "sigma_a0": sa0, "sigma_b0": sb0, "huber_delta": hd,
+            "lam_ridge": lam,
+            "qb_s": qb_s, "qb_d": qb_d,
+            "sigma_R": sR,
+            "sigma_b0": sb0,
+            "huber_delta": hd,
             "obj": obj,
-            "skip_update_ratio": diag["skip_update_ratio"],
             "N_EVAL_POINTS": micro["N_EVAL_POINTS"],
-            # micro KF
-            "KF_SBP_ME_micro": micro["KF_SBP_ME"],
-            "KF_SBP_SD_micro": micro["KF_SBP_SD"],
-            "KF_DBP_ME_micro": micro["KF_DBP_ME"],
-            "KF_DBP_SD_micro": micro["KF_DBP_SD"],
-            "KF_SBP_MAE_micro": micro["KF_SBP_MAE"],
-            "KF_DBP_MAE_micro": micro["KF_DBP_MAE"],
-            # micro RAW (for reference)
-            "RAW_SBP_SD_micro": micro["RAW_SBP_SD"],
-            "RAW_DBP_SD_micro": micro["RAW_DBP_SD"],
+            # compare micro
+            "RAW_SBP_SD": micro["RAW_SBP_SD"], "RAW_DBP_SD": micro["RAW_DBP_SD"],
+            "STA_SBP_SD": micro["STATIC_SBP_SD"], "STA_DBP_SD": micro["STATIC_DBP_SD"],
+            "TWO_SBP_SD": micro["TWO_SBP_SD"], "TWO_DBP_SD": micro["TWO_DBP_SD"],
+            "STA_SBP_ME": micro["STATIC_SBP_ME"], "STA_DBP_ME": micro["STATIC_DBP_ME"],
+            "TWO_SBP_ME": micro["TWO_SBP_ME"], "TWO_DBP_ME": micro["TWO_DBP_ME"],
+            "TWO_SBP_MAE": micro["TWO_SBP_MAE"], "TWO_DBP_MAE": micro["TWO_DBP_MAE"],
         }
         rows.append(row)
 
         if best is None or obj < best["obj"]:
             best = row
 
+        if use_tqdm:
+            it.set_postfix({
+                "best_obj": f"{best['obj']:.3f}",
+                "best_lam": best["lam_ridge"],
+                "best_qb": f"{best['qb_s']}/{best['qb_d']}",
+                "best_R": best["sigma_R"],
+            })
+
+        # partial save
+        if (step % 100) == 0:
+            pd.DataFrame(rows).to_csv(out_csv_path.replace(".csv", "_partial.csv"), index=False)
+
     res = pd.DataFrame(rows).sort_values("obj", ascending=True).reset_index(drop=True)
     res.to_csv(out_csv_path, index=False)
     return res, best
 
-
-# -----------------------------
-# Example usage:
-# res, best = grid_search_kf("val_set.csv", "kf_grid_val_results.csv")
+# res, best = grid_search_two_layer("val_set.csv", "two_layer_grid_val.csv", use_tqdm=True)
 # print("BEST:", best)
 # print(res.head(10))
-# -----------------------------
