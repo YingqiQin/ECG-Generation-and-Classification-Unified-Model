@@ -3,6 +3,7 @@ import datetime
 import json
 import math
 import os
+import sys
 import time
 from collections import OrderedDict
 from pathlib import Path
@@ -12,6 +13,11 @@ import pandas as pd
 import torch
 import torch.backends.cudnn as cudnn
 from timm.models import create_model
+
+# Ensure repo root is importable when running this script from custom_vqvae_tokenizer/.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from codebook import codebook_model  # noqa: F401, needed for timm model registry
 from codebook.codebook_engine import calculate_codebook_usage, evaluate, train_one_epoch
