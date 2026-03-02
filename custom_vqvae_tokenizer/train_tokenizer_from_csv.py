@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.backends.cudnn as cudnn
+import torch.distributed as dist
 from timm.models import create_model
 
 # Ensure repo root is importable when running this script from custom_vqvae_tokenizer/.
@@ -44,6 +45,11 @@ def get_args():
     parser.add_argument("--cache_size", type=int, default=16, help="Per-worker LRU cache of loaded npy files")
     parser.add_argument("--normalize", action="store_true", help="Per-segment min-max normalize to [-1, 1]")
     parser.add_argument("--max_rows", type=int, default=0, help="Debug: use first N rows")
+    parser.add_argument(
+        "--manual_grad_allreduce",
+        action="store_true",
+        help="Manually all-reduce gradients after backward, instead of DDP sync.",
+    )
 
     parser.add_argument("--batch_size", default=64, type=int)
     parser.add_argument("--epochs", default=100, type=int)
@@ -231,6 +237,30 @@ class CsvNPYSegmentDataset(torch.utils.data.Dataset):
         return torch.from_numpy(out).unsqueeze(0)
 
 
+class EvalModelProxy:
+    """
+    Proxy used when distributed training is enabled without wrapping model into DDP.
+    It provides `.module` expected by official evaluate() implementation.
+    """
+
+    def __init__(self, model: torch.nn.Module):
+        self.module = model
+
+    def __call__(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+    def train(self, mode: bool = True):
+        self.module.train(mode)
+        return self
+
+    def eval(self):
+        self.module.eval()
+        return self
+
+    def __getattr__(self, item):
+        return getattr(self.module, item)
+
+
 def get_model(args, **kwargs):
     print(f"Creating model: {args.model}")
     print(f"Consistency Loss Enabled: {args.use_consistency_loss}, Weight: {args.consistency_weight}")
@@ -339,6 +369,100 @@ def split_dataframe(df, args):
     if len(val_df) == 0:
         print("Validation split is empty, evaluation will be disabled.")
     return train_df.reset_index(drop=True), val_df.reset_index(drop=True)
+
+
+def manual_allreduce_gradients(model: torch.nn.Module, world_size: int):
+    if world_size <= 1:
+        return
+    if not dist.is_available() or not dist.is_initialized():
+        return
+
+    for para in model.parameters():
+        if para.grad is not None:
+            dist.all_reduce(para.grad.data, op=dist.ReduceOp.SUM)
+            para.grad.data /= float(world_size)
+
+
+def train_one_epoch_manual_allreduce(
+    model: torch.nn.Module,
+    data_loader: torch.utils.data.DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    max_norm: float = 0.0,
+    log_writer=None,
+    start_steps: int = 0,
+    lr_schedule_values=None,
+):
+    model.train()
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
+    metric_logger.add_meter("min_lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
+    header = f"Epoch: [{epoch}] (manual_allreduce)"
+    print_freq = 10
+
+    optimizer.zero_grad(set_to_none=True)
+    world_size = max(1, utils.get_world_size())
+
+    for step, batch_data in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+        it = start_steps + step
+        if lr_schedule_values is not None:
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr_schedule_values[it] * param_group.get("lr_scale", 1.0)
+
+        if isinstance(batch_data, (list, tuple)):
+            images = batch_data[0]
+        else:
+            images = batch_data
+
+        images = images.float().to(device, non_blocking=True)
+
+        loss, log_loss, _ = model(images, input_chans=[0, 1])
+        loss_value = loss.item()
+        if not math.isfinite(loss_value):
+            raise RuntimeError(f"Loss is {loss_value}, stopping training")
+
+        loss.backward()
+        manual_allreduce_gradients(model, world_size)
+
+        grad_norm = None
+        if max_norm is not None and max_norm > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+
+        metric_logger.update(loss=loss_value)
+        new_log_loss = {k.split("/")[-1]: v for k, v in log_loss.items() if k != "total_loss"}
+        metric_logger.update(**new_log_loss)
+
+        min_lr = min(g["lr"] for g in optimizer.param_groups)
+        max_lr = max(g["lr"] for g in optimizer.param_groups)
+        metric_logger.update(lr=max_lr)
+        metric_logger.update(min_lr=min_lr)
+
+        weight_decay_value = None
+        for group in optimizer.param_groups:
+            if group.get("weight_decay", 0) > 0:
+                weight_decay_value = group["weight_decay"]
+                break
+        metric_logger.update(weight_decay=weight_decay_value)
+        if grad_norm is not None:
+            metric_logger.update(grad_norm=grad_norm)
+
+        if log_writer is not None:
+            log_writer.update(train_loss=loss_value, head="loss", step=it)
+            log_writer.update(**new_log_loss, head="loss", step=it)
+            log_writer.update(lr=max_lr, head="opt", step=it)
+            log_writer.update(min_lr=min_lr, head="opt", step=it)
+            if weight_decay_value is not None:
+                log_writer.update(weight_decay=weight_decay_value, head="opt", step=it)
+            if grad_norm is not None:
+                log_writer.update(grad_norm=grad_norm, head="opt", step=it)
+
+    metric_logger.synchronize_between_processes()
+    print("Averaged stats:", metric_logger)
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 
 def main(args):
@@ -457,9 +581,11 @@ def main(args):
     optimizer = create_optimizer(args, model_without_ddp)
     loss_scaler = NativeScaler()
 
-    if args.distributed:
+    if args.distributed and not args.manual_grad_allreduce:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=True)
         model_without_ddp = model.module
+    elif args.distributed and args.manual_grad_allreduce:
+        print("Using manual gradient all-reduce mode (no DDP wrapper).")
 
     print("Use step level LR scheduler")
     lr_schedule_values = utils.cosine_scheduler(
@@ -479,17 +605,27 @@ def main(args):
     val_loader_list = [data_loader_val] if data_loader_val is not None else None
     val_ch_names_list = [dataset_val.get_ch_names()] if dataset_val is not None else None
 
+    model_for_eval = EvalModelProxy(model) if (args.distributed and args.manual_grad_allreduce) else model
+
     if args.eval:
         if val_loader_list is None:
             raise ValueError("No validation dataset available for --eval")
-        test_stats = evaluate(val_loader_list, model, device, log_writer, 0, ch_names_list=val_ch_names_list, args=args)
+        test_stats = evaluate(
+            val_loader_list,
+            model_for_eval,
+            device,
+            log_writer,
+            0,
+            ch_names_list=val_ch_names_list,
+            args=args,
+        )
         print(test_stats)
         return
 
     if args.calculate_codebook_usage:
         if val_loader_list is None:
             raise ValueError("No validation dataset available for --calculate_codebook_usage")
-        usage_stats = calculate_codebook_usage(val_loader_list[0], model, device, log_writer, 0, args=args)
+        usage_stats = calculate_codebook_usage(val_loader_list[0], model_for_eval, device, log_writer, 0, args=args)
         print(usage_stats)
         return
 
@@ -503,20 +639,33 @@ def main(args):
         if log_writer is not None:
             log_writer.set_step(epoch * num_training_steps_per_epoch)
 
-        train_stats = train_one_epoch(
-            model,
-            train_loader_list,
-            optimizer,
-            device,
-            epoch,
-            loss_scaler,
-            args.clip_grad,
-            log_writer=log_writer,
-            start_steps=epoch * num_training_steps_per_epoch,
-            lr_schedule_values=lr_schedule_values,
-            ch_names_list=train_ch_names_list,
-            args=args,
-        )
+        if args.manual_grad_allreduce:
+            train_stats = train_one_epoch_manual_allreduce(
+                model=model,
+                data_loader=data_loader_train,
+                optimizer=optimizer,
+                device=device,
+                epoch=epoch,
+                max_norm=args.clip_grad if args.clip_grad is not None else 0.0,
+                log_writer=log_writer,
+                start_steps=epoch * num_training_steps_per_epoch,
+                lr_schedule_values=lr_schedule_values,
+            )
+        else:
+            train_stats = train_one_epoch(
+                model,
+                train_loader_list,
+                optimizer,
+                device,
+                epoch,
+                loss_scaler,
+                args.clip_grad,
+                log_writer=log_writer,
+                start_steps=epoch * num_training_steps_per_epoch,
+                lr_schedule_values=lr_schedule_values,
+                ch_names_list=train_ch_names_list,
+                args=args,
+            )
 
         if args.output_dir:
             utils.save_model(
@@ -532,7 +681,7 @@ def main(args):
         if val_loader_list is not None:
             test_stats = evaluate(
                 val_loader_list,
-                model,
+                model_for_eval,
                 device,
                 log_writer,
                 epoch,
