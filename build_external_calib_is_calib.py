@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
-Build a new is_calib column from an external calibration-points CSV.
+Build a new is_calib column from an external calibration-points CSV,
+and optionally export a downsampled external calibration CSV in the same
+(id, time_timestamp) style for downstream reuse.
 
 Workflow
 --------
@@ -9,14 +11,9 @@ Workflow
 3) Match external points onto local events by (ID, timestamp).
 4) Optionally downsample matched external points to a per-subject quota,
    e.g. day 2 + sleep 2.
-5) Write a new CSV with a freshly generated is_calib column.
-
-Typical use case
-----------------
-External team provides ~7 calibration points / subject.
-You want to keep calibration consistent with them, but only use a capped subset
-such as 2 daytime + 2 sleep points per subject, then use the new is_calib for
-all downstream calibration / evaluation.
+5) Write:
+   - a new local CSV with a freshly generated is_calib column
+   - an optional selected external CSV with fewer calibration points
 """
 
 from __future__ import annotations
@@ -24,7 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -64,17 +61,16 @@ def _select_indices_by_strategy(
         return g.index[-n_select:].tolist()
 
     if strategy == "evenly_spaced":
-        # pick indices approximately uniformly over time span
         pos = np.linspace(0, len(g) - 1, n_select)
         chosen = np.round(pos).astype(int).tolist()
-        # de-duplicate while preserving order
+
         uniq = []
         seen = set()
         for c in chosen:
             if c not in seen:
                 uniq.append(c)
                 seen.add(c)
-        # back-fill if rounding caused duplicates
+
         if len(uniq) < n_select:
             for c in range(len(g)):
                 if c not in seen:
@@ -82,6 +78,7 @@ def _select_indices_by_strategy(
                     seen.add(c)
                 if len(uniq) >= n_select:
                     break
+
         return g.index[uniq[:n_select]].tolist()
 
     raise ValueError(f"Unknown strategy: {strategy}")
@@ -145,7 +142,7 @@ def downsample_external_matches(
     n_day: int,
     n_sleep: int,
     strategy: str,
-) -> Tuple[pd.DataFrame, Dict[str, float]]:
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
     """
     From rows already matched to external calibration points, select final is_calib rows.
 
@@ -162,7 +159,6 @@ def downsample_external_matches(
     out["_selected_final_calib"] = False
 
     matched_only = out[out["_is_external_match"]].copy()
-
     selected_indices: List[int] = []
 
     for sid, g_sub in matched_only.groupby(id_col):
@@ -223,6 +219,30 @@ def downsample_external_matches(
 
 
 
+def build_selected_external_csv(
+    selected_df: pd.DataFrame,
+    *,
+    df_id_col: str,
+    df_time_col: str,
+    ext_id_col: str,
+    ext_time_col: str,
+) -> pd.DataFrame:
+    """
+    Export selected calibration points in the same compact external format:
+    [ext_id_col, ext_time_col]
+    """
+    sel = selected_df[selected_df["_selected_final_calib"]].copy()
+    out = pd.DataFrame({
+        ext_id_col: _normalize_id(sel[df_id_col]),
+        ext_time_col: _normalize_time(sel[df_time_col]),
+    })
+    out = out.dropna(subset=[ext_id_col, ext_time_col]).copy()
+    out[ext_time_col] = out[ext_time_col].astype("int64")
+    out = out.drop_duplicates(subset=[ext_id_col, ext_time_col]).sort_values([ext_id_col, ext_time_col]).reset_index(drop=True)
+    return out
+
+
+
 def build_new_is_calib(
     df: pd.DataFrame,
     ext_df: pd.DataFrame,
@@ -265,6 +285,14 @@ def build_new_is_calib(
 
     out[is_calib_col] = out["_selected_final_calib"].astype(bool)
 
+    selected_external_df = build_selected_external_csv(
+        out,
+        df_id_col=df_id_col,
+        df_time_col=df_time_col,
+        ext_id_col=ext_id_col,
+        ext_time_col=ext_time_col,
+    )
+
     final_report = {
         "match_report": match_report,
         "selection_summary": select_report["summary"],
@@ -273,11 +301,13 @@ def build_new_is_calib(
         "n_sleep": int(n_sleep),
         "strategy": strategy,
         "n_final_is_calib_rows": int(out[is_calib_col].sum()),
+        "n_selected_external_points": int(len(selected_external_df)),
     }
 
     return out, {
         "report": final_report,
         "per_subject": select_report["per_subject"],
+        "selected_external_df": selected_external_df,
     }
 
 
@@ -289,8 +319,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build new is_calib from external calibration points")
     parser.add_argument("--input_csv", required=True, help="Local event-level CSV")
     parser.add_argument("--external_csv", required=True, help="External calibration CSV")
-    parser.add_argument("--output_csv", required=True, help="Output CSV with refreshed is_calib")
+    parser.add_argument("--output_csv", required=True, help="Output local CSV with refreshed is_calib")
     parser.add_argument("--report_dir", required=True, help="Directory for reports")
+    parser.add_argument(
+        "--output_selected_external_csv",
+        default=None,
+        help="Optional path to export the downsampled external calibration CSV (same compact format as external_csv)",
+    )
 
     parser.add_argument("--df_id_col", default="id_upper")
     parser.add_argument("--df_time_col", default="t_bp_ms")
@@ -333,8 +368,12 @@ def main() -> None:
     external_csv = Path(args.external_csv)
     output_csv = Path(args.output_csv)
     report_dir = Path(args.report_dir)
+    output_selected_external_csv = Path(args.output_selected_external_csv) if args.output_selected_external_csv else None
+
     report_dir.mkdir(parents=True, exist_ok=True)
     output_csv.parent.mkdir(parents=True, exist_ok=True)
+    if output_selected_external_csv is not None:
+        output_selected_external_csv.parent.mkdir(parents=True, exist_ok=True)
 
     df = pd.read_csv(input_csv)
     ext_df = pd.read_csv(external_csv)
@@ -355,15 +394,20 @@ def main() -> None:
         keep_old_is_calib=args.keep_old_is_calib,
     )
 
-    # Clean helper columns before write
-    helper_cols = [c for c in ["_match_id", "_match_t", "_is_external_match", "_selected_final_calib"] if c in out_df.columns]
+    helper_cols = [
+        c for c in ["_match_id", "_match_t", "_is_external_match", "_selected_final_calib"] if c in out_df.columns
+    ]
     write_df = out_df.drop(columns=helper_cols)
     write_df.to_csv(output_csv, index=False)
+
+    if output_selected_external_csv is not None:
+        artifacts["selected_external_df"].to_csv(output_selected_external_csv, index=False)
 
     with open(report_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(artifacts["report"], f, indent=2, ensure_ascii=False)
 
     artifacts["per_subject"].to_csv(report_dir / "per_subject_selection.csv", index=False)
+    artifacts["selected_external_df"].to_csv(report_dir / "selected_external_points.csv", index=False)
 
     with open(report_dir / "summary.txt", "w", encoding="utf-8") as f:
         f.write("=== build_external_calib_is_calib summary ===\n")
@@ -372,8 +416,11 @@ def main() -> None:
 
     print("Saved:")
     print(f"  output_csv: {output_csv}")
+    if output_selected_external_csv is not None:
+        print(f"  output_selected_external_csv: {output_selected_external_csv}")
     print(f"  summary.json: {report_dir / 'summary.json'}")
     print(f"  per_subject_selection.csv: {report_dir / 'per_subject_selection.csv'}")
+    print(f"  selected_external_points.csv: {report_dir / 'selected_external_points.csv'}")
 
 
 if __name__ == "__main__":
