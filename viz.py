@@ -21,6 +21,7 @@ ALL_SIGNAL_CHANNELS = [*STANDARD_CHANNELS, UPPER_ARM_CHANNEL]
 REQUIRED_COLUMNS = ["timestamp_ms", *ALL_SIGNAL_CHANNELS]
 FILENAME_PATTERN = re.compile(r"emg_data_(\d{8})_(\d{6})\.csv$")
 DEFAULT_SEGMENT_SECONDS = 8.0
+SUPPORTED_CORR_METHODS = ("pearson", "spearman", "kendall")
 
 
 @dataclass
@@ -112,6 +113,13 @@ def parse_args() -> argparse.Namespace:
             "Column name to read from reconstruction CSV files. If absent and the file "
             "has exactly one non-timestamp column, that column is used automatically."
         ),
+    )
+    parser.add_argument(
+        "--corr-method",
+        type=str,
+        default="pearson",
+        choices=SUPPORTED_CORR_METHODS,
+        help="Correlation method for waveform similarity and reconstruction scoring.",
     )
     return parser.parse_args()
 
@@ -326,12 +334,16 @@ def compute_channel_metrics(
     }
 
 
-def compute_pairwise_correlations(filtered_df: pd.DataFrame, source_channel: str) -> dict[str, float]:
+def compute_pairwise_correlations(
+    filtered_df: pd.DataFrame,
+    source_channel: str,
+    corr_method: str,
+) -> dict[str, float]:
     source = normalize_signal(filtered_df[source_channel]).reset_index(drop=True)
     correlations: dict[str, float] = {}
     for channel in STANDARD_CHANNELS:
         target = normalize_signal(filtered_df[channel]).reset_index(drop=True)
-        correlations[channel] = float(source.corr(target))
+        correlations[channel] = float(source.corr(target, method=corr_method))
     return correlations
 
 
@@ -339,10 +351,11 @@ def compute_cross_channel_metrics(
     filtered_df: pd.DataFrame,
     reference_channel: str,
     upperarm_channel: str,
+    corr_method: str,
 ) -> tuple[float, float]:
     ref = normalize_signal(filtered_df[reference_channel]).reset_index(drop=True)
     upper = normalize_signal(filtered_df[upperarm_channel]).reset_index(drop=True)
-    corr = float(ref.corr(upper))
+    corr = float(ref.corr(upper, method=corr_method))
 
     ref_abs = ref.abs()
     upper_abs = upper.abs()
@@ -355,6 +368,7 @@ def evaluate_reconstruction(
     recon_df: pd.DataFrame,
     target_channel: str,
     sampling_rate_hz: float,
+    corr_method: str,
 ) -> dict[str, float]:
     merged = filtered_df[["timestamp_ms", target_channel]].merge(recon_df, on="timestamp_ms", how="inner")
     if merged.empty:
@@ -365,7 +379,7 @@ def evaluate_reconstruction(
     target_norm = normalize_signal(target_filtered).reset_index(drop=True)
     recon_norm = normalize_signal(recon_filtered).reset_index(drop=True)
 
-    corr = float(target_norm.corr(recon_norm))
+    corr = float(target_norm.corr(recon_norm, method=corr_method))
     diff = target_norm - recon_norm
     mae = float(diff.abs().mean())
     rmse = float((diff.pow(2).mean()) ** 0.5)
@@ -793,6 +807,7 @@ def analyze_recording(
     segment_seconds: float,
     recon_dir: Path | None,
     recon_column: str,
+    corr_method: str,
 ) -> RecordingSummary:
     df, removed_rows = read_csv(path)
     capture_label = extract_capture_label(path)
@@ -811,12 +826,17 @@ def analyze_recording(
         )
 
     reference_channel = select_reference_channel(channel_metrics)
-    upperarm_correlations = compute_pairwise_correlations(filtered_df, source_channel=UPPER_ARM_CHANNEL)
+    upperarm_correlations = compute_pairwise_correlations(
+        filtered_df,
+        source_channel=UPPER_ARM_CHANNEL,
+        corr_method=corr_method,
+    )
     upperarm_best_match_channel, upperarm_best_match_corr = select_best_match_channel(upperarm_correlations)
     upper_corr, upper_energy_ratio = compute_cross_channel_metrics(
         filtered_df=filtered_df,
         reference_channel=reference_channel,
         upperarm_channel=UPPER_ARM_CHANNEL,
+        corr_method=corr_method,
     )
 
     summary_title = (
@@ -874,6 +894,7 @@ def analyze_recording(
                 recon_df=recon_df,
                 target_channel=upperarm_best_match_channel,
                 sampling_rate_hz=sampling_rate_hz,
+                corr_method=corr_method,
             )
             reconstruction_available = True
             reconstruction_corr = recon_metrics["corr"]
@@ -905,6 +926,7 @@ def analyze_recording(
         "sampling_rate_hz": sampling_rate_hz,
         "sampling_interval_ms": sampling_interval_ms,
         "sampling_jitter_ms": sampling_jitter_ms,
+        "corr_method": corr_method,
         "reference_channel": reference_channel,
         "reference_quality_score": reference_metrics["quality_score"],
         "reference_estimated_bpm": reference_metrics["estimated_bpm"],
@@ -990,6 +1012,7 @@ def main() -> None:
             segment_seconds=args.segment_seconds,
             recon_dir=recon_dir,
             recon_column=args.recon_column,
+            corr_method=args.corr_method,
         )
         summaries.append(summary)
         recon_text = (
@@ -999,6 +1022,7 @@ def main() -> None:
         )
         print(
             f"Analyzed {path.name} | fs={format_float(summary.sampling_rate_hz, 2)} Hz | "
+            f"corr_method={args.corr_method} | "
             f"best_match={summary.upperarm_best_match_channel} ({format_float(summary.upperarm_best_match_corr, 3)}) | "
             f"CH20_score={format_float(summary.upperarm_quality_score, 1)}{recon_text}"
         )
