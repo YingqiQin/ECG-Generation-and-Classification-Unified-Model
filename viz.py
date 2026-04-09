@@ -37,12 +37,20 @@ class RecordingSummary:
     reference_quality_score: float
     upperarm_quality_score: float
     upperarm_vs_reference_corr: float
+    upperarm_best_match_channel: str
+    upperarm_best_match_corr: float
     upperarm_bpm: float
+    reconstruction_available: bool
+    reconstruction_corr: float
+    reconstruction_mae: float
+    reconstruction_rmse: float
     report_row: dict[str, object]
     raw_plot_path: Path
     filtered_plot_path: Path
     beat_plot_path: Path
     quality_plot_path: Path
+    similarity_plot_path: Path
+    reconstruction_plot_path: Path | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,6 +94,24 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_SEGMENT_SECONDS,
         help="Length of the beat inspection window in seconds.",
+    )
+    parser.add_argument(
+        "--recon-dir",
+        type=Path,
+        default=None,
+        help=(
+            "Optional folder containing reconstructed ECG CSV files with the same "
+            "filenames as the input recordings."
+        ),
+    )
+    parser.add_argument(
+        "--recon-column",
+        type=str,
+        default="reconstructed_signal",
+        help=(
+            "Column name to read from reconstruction CSV files. If absent and the file "
+            "has exactly one non-timestamp column, that column is used automatically."
+        ),
     )
     return parser.parse_args()
 
@@ -131,6 +157,32 @@ def read_csv(path: Path) -> tuple[pd.DataFrame, int]:
     if df.empty:
         raise ValueError(f"{path.name} has no valid numeric rows after cleaning")
     return df.reset_index(drop=True), removed_rows
+
+
+def read_reconstruction_csv(path: Path, recon_column: str) -> pd.DataFrame:
+    raw_df = pd.read_csv(path)
+    if "timestamp_ms" not in raw_df.columns:
+        raise ValueError(f"{path.name} is missing required column timestamp_ms")
+
+    if recon_column in raw_df.columns:
+        signal_column = recon_column
+    else:
+        candidate_columns = [column for column in raw_df.columns if column != "timestamp_ms"]
+        if len(candidate_columns) != 1:
+            raise ValueError(
+                f"{path.name} must contain column {recon_column} or exactly one "
+                "non-timestamp signal column"
+            )
+        signal_column = candidate_columns[0]
+
+    df = raw_df[["timestamp_ms", signal_column]].copy()
+    df["timestamp_ms"] = pd.to_numeric(df["timestamp_ms"], errors="coerce")
+    df[signal_column] = pd.to_numeric(df[signal_column], errors="coerce")
+    df = df.dropna(subset=["timestamp_ms", signal_column]).reset_index(drop=True)
+    if df.empty:
+        raise ValueError(f"{path.name} has no valid rows after cleaning")
+
+    return df.rename(columns={signal_column: "reconstructed_signal"})
 
 
 def maybe_downsample(df: pd.DataFrame, max_points: int) -> pd.DataFrame:
@@ -274,6 +326,15 @@ def compute_channel_metrics(
     }
 
 
+def compute_pairwise_correlations(filtered_df: pd.DataFrame, source_channel: str) -> dict[str, float]:
+    source = normalize_signal(filtered_df[source_channel]).reset_index(drop=True)
+    correlations: dict[str, float] = {}
+    for channel in STANDARD_CHANNELS:
+        target = normalize_signal(filtered_df[channel]).reset_index(drop=True)
+        correlations[channel] = float(source.corr(target))
+    return correlations
+
+
 def compute_cross_channel_metrics(
     filtered_df: pd.DataFrame,
     reference_channel: str,
@@ -287,6 +348,36 @@ def compute_cross_channel_metrics(
     upper_abs = upper.abs()
     energy_ratio = float(upper_abs.mean() / (ref_abs.mean() + 1e-9))
     return corr, energy_ratio
+
+
+def evaluate_reconstruction(
+    filtered_df: pd.DataFrame,
+    recon_df: pd.DataFrame,
+    target_channel: str,
+    sampling_rate_hz: float,
+) -> dict[str, float]:
+    merged = filtered_df[["timestamp_ms", target_channel]].merge(recon_df, on="timestamp_ms", how="inner")
+    if merged.empty:
+        raise ValueError("Reconstruction file does not align with input timestamps")
+
+    target_filtered = filter_signal(merged[target_channel], sampling_rate_hz=sampling_rate_hz)
+    recon_filtered = filter_signal(merged["reconstructed_signal"], sampling_rate_hz=sampling_rate_hz)
+    target_norm = normalize_signal(target_filtered).reset_index(drop=True)
+    recon_norm = normalize_signal(recon_filtered).reset_index(drop=True)
+
+    corr = float(target_norm.corr(recon_norm))
+    diff = target_norm - recon_norm
+    mae = float(diff.abs().mean())
+    rmse = float((diff.pow(2).mean()) ** 0.5)
+    cosine = float((target_norm * recon_norm).mean() / ((target_norm.pow(2).mean() ** 0.5) * (recon_norm.pow(2).mean() ** 0.5) + 1e-9))
+
+    return {
+        "aligned_sample_count": float(len(merged)),
+        "corr": corr,
+        "mae": mae,
+        "rmse": rmse,
+        "cosine_similarity": cosine,
+    }
 
 
 def build_filtered_df(df: pd.DataFrame, sampling_rate_hz: float) -> pd.DataFrame:
@@ -308,6 +399,11 @@ def select_reference_channel(channel_metrics: dict[str, dict[str, float]]) -> st
     return ranked[0]
 
 
+def select_best_match_channel(correlations: dict[str, float]) -> tuple[str, float]:
+    ranked = sorted(correlations.items(), key=lambda item: abs(item[1]), reverse=True)
+    return ranked[0]
+
+
 def plot_raw_recording(
     df: pd.DataFrame,
     summary_title: str,
@@ -318,13 +414,7 @@ def plot_raw_recording(
     plot_df = maybe_downsample(df, max_points=max_points)
     time_s = (plot_df["timestamp_ms"] - plot_df["timestamp_ms"].iloc[0]) / 1000.0
 
-    fig, axes = plt.subplots(
-        nrows=3,
-        ncols=1,
-        figsize=(16, 10),
-        sharex=True,
-        constrained_layout=True,
-    )
+    fig, axes = plt.subplots(nrows=3, ncols=1, figsize=(16, 10), sharex=True, constrained_layout=True)
 
     for channel in STANDARD_CHANNELS[:4]:
         axes[0].plot(time_s, plot_df[channel], linewidth=0.8, label=channel)
@@ -397,7 +487,8 @@ def choose_segment_start_seconds(
 
     time_s = (df["timestamp_ms"] - df["timestamp_ms"].iloc[0]) / 1000.0
     abs_signal = normalize_signal(filtered_df[reference_channel]).abs()
-    rolling = abs_signal.rolling(window=max(3, int(len(df) * segment_seconds / max(total_duration_s, 1e-9) / 3)), min_periods=1).mean()
+    window = max(3, int(len(df) * segment_seconds / max(total_duration_s, 1e-9) / 3))
+    rolling = abs_signal.rolling(window=window, min_periods=1).mean()
     best_idx = int(rolling.idxmax())
     center_s = float(time_s.iloc[best_idx])
     start_s = max(0.0, min(total_duration_s - segment_seconds, center_s - segment_seconds / 2.0))
@@ -427,13 +518,7 @@ def plot_beat_inspection(
     ref_peaks = detect_peaks(ref_signal, sampling_rate_hz=sampling_rate_hz)
     upper_peaks = detect_peaks(upper_signal, sampling_rate_hz=sampling_rate_hz)
 
-    fig, axes = plt.subplots(
-        nrows=2,
-        ncols=1,
-        figsize=(16, 8),
-        sharex=True,
-        constrained_layout=True,
-    )
+    fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(16, 8), sharex=True, constrained_layout=True)
 
     axes[0].plot(seg_time, ref_norm, color="#22577A", linewidth=1.0, label=reference_channel)
     if ref_peaks:
@@ -468,12 +553,7 @@ def plot_quality_bars(
     estimated_bpms = [channel_metrics[channel]["estimated_bpm"] for channel in channels]
     baseline_ratios = [channel_metrics[channel]["baseline_ratio"] for channel in channels]
 
-    fig, axes = plt.subplots(
-        nrows=3,
-        ncols=1,
-        figsize=(15, 11),
-        constrained_layout=True,
-    )
+    fig, axes = plt.subplots(nrows=3, ncols=1, figsize=(15, 11), constrained_layout=True)
 
     axes[0].bar(channels, quality_scores, color=["black" if channel == UPPER_ARM_CHANNEL else "#5DA271" for channel in channels])
     axes[0].set_title("Quality Score by Channel")
@@ -495,19 +575,69 @@ def plot_quality_bars(
     plt.close(fig)
 
 
+def plot_similarity_heatmap(
+    correlations: dict[str, float],
+    summary_title: str,
+    best_match_channel: str,
+    output_path: Path,
+    dpi: int,
+) -> None:
+    ordered_values = [[correlations[channel] for channel in STANDARD_CHANNELS]]
+    fig, ax = plt.subplots(figsize=(12, 2.8), constrained_layout=True)
+    image = ax.imshow(ordered_values, cmap="coolwarm", aspect="auto", vmin=-1.0, vmax=1.0)
+    ax.set_title(f"CH20 Similarity to Standard Channels | Best match {best_match_channel}")
+    ax.set_xticks(range(len(STANDARD_CHANNELS)))
+    ax.set_xticklabels(STANDARD_CHANNELS)
+    ax.set_yticks([0])
+    ax.set_yticklabels([UPPER_ARM_CHANNEL])
+    for idx, channel in enumerate(STANDARD_CHANNELS):
+        ax.text(idx, 0, f"{correlations[channel]:.2f}", ha="center", va="center", color="black", fontsize=10)
+    fig.colorbar(image, ax=ax, fraction=0.05, pad=0.03, label="Correlation")
+    fig.suptitle(summary_title)
+    fig.savefig(output_path, dpi=dpi)
+    plt.close(fig)
+
+
+def plot_reconstruction_comparison(
+    filtered_df: pd.DataFrame,
+    recon_df: pd.DataFrame,
+    target_channel: str,
+    summary_title: str,
+    output_path: Path,
+    dpi: int,
+    max_points: int,
+    sampling_rate_hz: float,
+) -> None:
+    merged = filtered_df[["timestamp_ms", target_channel]].merge(recon_df, on="timestamp_ms", how="inner")
+    if merged.empty:
+        return
+
+    merged["target_filtered"] = filter_signal(merged[target_channel], sampling_rate_hz=sampling_rate_hz)
+    merged["recon_filtered"] = filter_signal(merged["reconstructed_signal"], sampling_rate_hz=sampling_rate_hz)
+    plot_df = maybe_downsample(merged[["timestamp_ms", "target_filtered", "recon_filtered"]], max_points=max_points)
+    time_s = (plot_df["timestamp_ms"] - plot_df["timestamp_ms"].iloc[0]) / 1000.0
+
+    fig, ax = plt.subplots(figsize=(16, 5), constrained_layout=True)
+    ax.plot(time_s, normalize_signal(plot_df["target_filtered"]), label=f"Target {target_channel}", color="#22577A", linewidth=1.0)
+    ax.plot(time_s, normalize_signal(plot_df["recon_filtered"]), label="AutoEncoder reconstruction", color="#D1495B", linewidth=1.0, alpha=0.85)
+    ax.set_title(f"Reconstruction vs Most Similar Channel ({target_channel})")
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Normalized amplitude")
+    ax.grid(alpha=0.25)
+    ax.legend(loc="upper right")
+    fig.suptitle(summary_title)
+    fig.savefig(output_path, dpi=dpi)
+    plt.close(fig)
+
+
 def plot_overview(summaries: list[RecordingSummary], output_dir: Path, dpi: int) -> Path:
     labels = [item.capture_label for item in summaries]
     durations = [item.duration_seconds for item in summaries]
     sample_counts = [item.sample_count for item in summaries]
     upperarm_scores = [item.upperarm_quality_score for item in summaries]
-    corrs = [item.upperarm_vs_reference_corr for item in summaries]
+    corrs = [item.upperarm_best_match_corr for item in summaries]
 
-    fig, axes = plt.subplots(
-        nrows=4,
-        ncols=1,
-        figsize=(18, 14),
-        constrained_layout=True,
-    )
+    fig, axes = plt.subplots(nrows=4, ncols=1, figsize=(18, 14), constrained_layout=True)
 
     axes[0].bar(range(len(summaries)), durations, color="#3A7CA5")
     axes[0].set_title("Recording Duration by File")
@@ -525,7 +655,7 @@ def plot_overview(summaries: list[RecordingSummary], output_dir: Path, dpi: int)
     axes[2].grid(axis="y", alpha=0.25)
 
     axes[3].bar(range(len(summaries)), corrs, color="#B56576")
-    axes[3].set_title("CH20 vs Best Standard Channel Correlation")
+    axes[3].set_title("Best CH20 Correlation to Any Standard Channel")
     axes[3].set_ylabel("Correlation")
     axes[3].grid(axis="y", alpha=0.25)
 
@@ -549,6 +679,14 @@ def write_html_report(summaries: list[RecordingSummary], overview_path: Path, ou
 
     rows = []
     for summary in summaries:
+        reconstruction_text = (
+            f"{summary.reconstruction_corr:.3f}" if summary.reconstruction_available else "n/a"
+        )
+        reconstruction_link = (
+            f"<a href=\"{html.escape(rel(summary.reconstruction_plot_path))}\">recon</a>"
+            if summary.reconstruction_plot_path
+            else "n/a"
+        )
         row = (
             "<tr>"
             f"<td>{html.escape(summary.path.name)}</td>"
@@ -556,32 +694,48 @@ def write_html_report(summaries: list[RecordingSummary], overview_path: Path, ou
             f"<td>{summary.duration_seconds:.2f}</td>"
             f"<td>{summary.sample_count}</td>"
             f"<td>{summary.sampling_rate_hz:.2f}</td>"
-            f"<td>{html.escape(summary.reference_channel)}</td>"
-            f"<td>{summary.reference_quality_score:.1f}</td>"
+            f"<td>{html.escape(summary.upperarm_best_match_channel)}</td>"
+            f"<td>{summary.upperarm_best_match_corr:.3f}</td>"
             f"<td>{summary.upperarm_quality_score:.1f}</td>"
-            f"<td>{summary.upperarm_vs_reference_corr:.3f}</td>"
             f"<td>{summary.upperarm_bpm:.1f}</td>"
+            f"<td>{reconstruction_text}</td>"
             f"<td><a href=\"{html.escape(rel(summary.raw_plot_path))}\">raw</a></td>"
             f"<td><a href=\"{html.escape(rel(summary.filtered_plot_path))}\">filtered</a></td>"
             f"<td><a href=\"{html.escape(rel(summary.beat_plot_path))}\">beats</a></td>"
             f"<td><a href=\"{html.escape(rel(summary.quality_plot_path))}\">quality</a></td>"
+            f"<td><a href=\"{html.escape(rel(summary.similarity_plot_path))}\">similarity</a></td>"
+            f"<td>{reconstruction_link}</td>"
             "</tr>"
         )
         rows.append(row)
 
     detail_sections = []
     for summary in summaries:
+        reconstruction_paragraph = (
+            f"<p>Reconstruction corr {summary.reconstruction_corr:.3f} | "
+            f"MAE {summary.reconstruction_mae:.3f} | RMSE {summary.reconstruction_rmse:.3f}</p>"
+            if summary.reconstruction_available
+            else "<p>No reconstruction file matched this recording.</p>"
+        )
+        reconstruction_image = (
+            f"<img src=\"{html.escape(rel(summary.reconstruction_plot_path))}\" alt=\"Reconstruction plot for {html.escape(summary.path.name)}\">"
+            if summary.reconstruction_plot_path
+            else ""
+        )
         detail_sections.append(
             "\n".join(
                 [
                     "<section class=\"card\">",
                     f"<h2>{html.escape(summary.path.name)}</h2>",
-                    f"<p>Capture {html.escape(summary.capture_label)} | Best standard channel {html.escape(summary.reference_channel)} | "
-                    f"CH20 quality {summary.upperarm_quality_score:.1f} | Correlation {summary.upperarm_vs_reference_corr:.3f}</p>",
+                    f"<p>Capture {html.escape(summary.capture_label)} | Best standard quality channel {html.escape(summary.reference_channel)} | "
+                    f"Most similar to CH20: {html.escape(summary.upperarm_best_match_channel)} ({summary.upperarm_best_match_corr:.3f})</p>",
+                    reconstruction_paragraph,
                     f"<img src=\"{html.escape(rel(summary.raw_plot_path))}\" alt=\"Raw plot for {html.escape(summary.path.name)}\">",
                     f"<img src=\"{html.escape(rel(summary.filtered_plot_path))}\" alt=\"Filtered plot for {html.escape(summary.path.name)}\">",
                     f"<img src=\"{html.escape(rel(summary.beat_plot_path))}\" alt=\"Beat plot for {html.escape(summary.path.name)}\">",
                     f"<img src=\"{html.escape(rel(summary.quality_plot_path))}\" alt=\"Quality plot for {html.escape(summary.path.name)}\">",
+                    f"<img src=\"{html.escape(rel(summary.similarity_plot_path))}\" alt=\"Similarity plot for {html.escape(summary.path.name)}\">",
+                    reconstruction_image,
                     "</section>",
                 ]
             )
@@ -608,14 +762,14 @@ def write_html_report(summaries: list[RecordingSummary], overview_path: Path, ou
             "</head>",
             "<body>",
             "<h1>ECG Visualization and Quality Report</h1>",
-            "<p>This report summarizes standard ECG channels CH1-CH8 and upper-arm ECG channel CH20 for all discovered files.</p>",
+            "<p>Evaluation focuses on two questions: which standard lead looks most similar to self-captured CH20, and how well an AutoEncoder reconstruction matches that most similar lead.</p>",
             "<section class=\"card\">",
             "<h2>Overview</h2>",
             f"<img src=\"{html.escape(rel(overview_path))}\" alt=\"Overview plot\">",
             "<table>",
-            "<thead><tr><th>File</th><th>Capture</th><th>Duration s</th><th>Samples</th><th>Hz</th><th>Best std ch</th>"
-            "<th>Best std score</th><th>CH20 score</th><th>CH20 corr</th><th>CH20 BPM</th>"
-            "<th>Raw</th><th>Filtered</th><th>Beats</th><th>Quality</th></tr></thead>",
+            "<thead><tr><th>File</th><th>Capture</th><th>Duration s</th><th>Samples</th><th>Hz</th>"
+            "<th>Best CH20 match</th><th>Best corr</th><th>CH20 score</th><th>CH20 BPM</th><th>Recon corr</th>"
+            "<th>Raw</th><th>Filtered</th><th>Beats</th><th>Quality</th><th>Similarity</th><th>Recon</th></tr></thead>",
             "<tbody>",
             *rows,
             "</tbody></table>",
@@ -637,6 +791,8 @@ def analyze_recording(
     dpi: int,
     max_points: int,
     segment_seconds: float,
+    recon_dir: Path | None,
+    recon_column: str,
 ) -> RecordingSummary:
     df, removed_rows = read_csv(path)
     capture_label = extract_capture_label(path)
@@ -655,6 +811,8 @@ def analyze_recording(
         )
 
     reference_channel = select_reference_channel(channel_metrics)
+    upperarm_correlations = compute_pairwise_correlations(filtered_df, source_channel=UPPER_ARM_CHANNEL)
+    upperarm_best_match_channel, upperarm_best_match_corr = select_best_match_channel(upperarm_correlations)
     upper_corr, upper_energy_ratio = compute_cross_channel_metrics(
         filtered_df=filtered_df,
         reference_channel=reference_channel,
@@ -670,6 +828,8 @@ def analyze_recording(
     filtered_plot_path = output_dir / f"{path.stem}_filtered.png"
     beat_plot_path = output_dir / f"{path.stem}_beats.png"
     quality_plot_path = output_dir / f"{path.stem}_quality.png"
+    similarity_plot_path = output_dir / f"{path.stem}_similarity.png"
+    reconstruction_plot_path = None
 
     plot_raw_recording(df=df, summary_title=summary_title, output_path=raw_plot_path, dpi=dpi, max_points=max_points)
     plot_filtered_stacked(
@@ -689,12 +849,49 @@ def analyze_recording(
         segment_seconds=segment_seconds,
         sampling_rate_hz=sampling_rate_hz,
     )
-    plot_quality_bars(
-        channel_metrics=channel_metrics,
+    plot_quality_bars(channel_metrics=channel_metrics, summary_title=summary_title, output_path=quality_plot_path, dpi=dpi)
+    plot_similarity_heatmap(
+        correlations=upperarm_correlations,
         summary_title=summary_title,
-        output_path=quality_plot_path,
+        best_match_channel=upperarm_best_match_channel,
+        output_path=similarity_plot_path,
         dpi=dpi,
     )
+
+    reconstruction_available = False
+    reconstruction_corr = float("nan")
+    reconstruction_mae = float("nan")
+    reconstruction_rmse = float("nan")
+    reconstruction_cosine = float("nan")
+    reconstruction_aligned_count = float("nan")
+
+    if recon_dir is not None:
+        recon_path = recon_dir / path.name
+        if recon_path.exists():
+            recon_df = read_reconstruction_csv(recon_path, recon_column=recon_column)
+            recon_metrics = evaluate_reconstruction(
+                filtered_df=filtered_df,
+                recon_df=recon_df,
+                target_channel=upperarm_best_match_channel,
+                sampling_rate_hz=sampling_rate_hz,
+            )
+            reconstruction_available = True
+            reconstruction_corr = recon_metrics["corr"]
+            reconstruction_mae = recon_metrics["mae"]
+            reconstruction_rmse = recon_metrics["rmse"]
+            reconstruction_cosine = recon_metrics["cosine_similarity"]
+            reconstruction_aligned_count = recon_metrics["aligned_sample_count"]
+            reconstruction_plot_path = output_dir / f"{path.stem}_reconstruction.png"
+            plot_reconstruction_comparison(
+                filtered_df=filtered_df,
+                recon_df=recon_df,
+                target_channel=upperarm_best_match_channel,
+                summary_title=summary_title,
+                output_path=reconstruction_plot_path,
+                dpi=dpi,
+                max_points=max_points,
+                sampling_rate_hz=sampling_rate_hz,
+            )
 
     reference_metrics = channel_metrics[reference_channel]
     upper_metrics = channel_metrics[UPPER_ARM_CHANNEL]
@@ -718,7 +915,19 @@ def analyze_recording(
         "upperarm_clipping_ratio": upper_metrics["clipping_ratio"],
         "upperarm_vs_reference_corr": upper_corr,
         "upperarm_vs_reference_energy_ratio": upper_energy_ratio,
+        "upperarm_best_match_channel": upperarm_best_match_channel,
+        "upperarm_best_match_corr": upperarm_best_match_corr,
+        "reconstruction_available": reconstruction_available,
+        "reconstruction_target_channel": upperarm_best_match_channel if reconstruction_available else "",
+        "reconstruction_corr": reconstruction_corr,
+        "reconstruction_mae": reconstruction_mae,
+        "reconstruction_rmse": reconstruction_rmse,
+        "reconstruction_cosine_similarity": reconstruction_cosine,
+        "reconstruction_aligned_sample_count": reconstruction_aligned_count,
     }
+
+    for channel in STANDARD_CHANNELS:
+        report_row[f"ch20_vs_{channel.lower()}_corr"] = upperarm_correlations[channel]
 
     for channel in ALL_SIGNAL_CHANNELS:
         metrics = channel_metrics[channel]
@@ -743,12 +952,20 @@ def analyze_recording(
         reference_quality_score=reference_metrics["quality_score"],
         upperarm_quality_score=upper_metrics["quality_score"],
         upperarm_vs_reference_corr=upper_corr,
+        upperarm_best_match_channel=upperarm_best_match_channel,
+        upperarm_best_match_corr=upperarm_best_match_corr,
         upperarm_bpm=0.0 if pd.isna(upper_metrics["estimated_bpm"]) else upper_metrics["estimated_bpm"],
+        reconstruction_available=reconstruction_available,
+        reconstruction_corr=reconstruction_corr,
+        reconstruction_mae=reconstruction_mae,
+        reconstruction_rmse=reconstruction_rmse,
         report_row=report_row,
         raw_plot_path=raw_plot_path,
         filtered_plot_path=filtered_plot_path,
         beat_plot_path=beat_plot_path,
         quality_plot_path=quality_plot_path,
+        similarity_plot_path=similarity_plot_path,
+        reconstruction_plot_path=reconstruction_plot_path,
     )
 
 
@@ -756,6 +973,7 @@ def main() -> None:
     args = parse_args()
     input_dir = args.input_dir.expanduser().resolve()
     output_dir = args.output_dir.expanduser().resolve()
+    recon_dir = args.recon_dir.expanduser().resolve() if args.recon_dir else None
     output_dir.mkdir(parents=True, exist_ok=True)
 
     csv_files = find_csv_files(input_dir, args.limit)
@@ -770,13 +988,19 @@ def main() -> None:
             dpi=args.dpi,
             max_points=args.max_points,
             segment_seconds=args.segment_seconds,
+            recon_dir=recon_dir,
+            recon_column=args.recon_column,
         )
         summaries.append(summary)
+        recon_text = (
+            f" | recon_corr={format_float(summary.reconstruction_corr, 3)}"
+            if summary.reconstruction_available
+            else ""
+        )
         print(
             f"Analyzed {path.name} | fs={format_float(summary.sampling_rate_hz, 2)} Hz | "
-            f"ref={summary.reference_channel} ({format_float(summary.reference_quality_score, 1)}) | "
-            f"CH20={format_float(summary.upperarm_quality_score, 1)} | "
-            f"corr={format_float(summary.upperarm_vs_reference_corr, 3)}"
+            f"best_match={summary.upperarm_best_match_channel} ({format_float(summary.upperarm_best_match_corr, 3)}) | "
+            f"CH20_score={format_float(summary.upperarm_quality_score, 1)}{recon_text}"
         )
 
     summary_df = build_summary_table(summaries)
