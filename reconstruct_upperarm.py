@@ -8,6 +8,9 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from scipy import sparse
+from scipy.sparse import linalg as sparse_linalg
+from scipy.spatial import distance
 import torch
 
 from mcma_torch.data.upperarm_csv import (
@@ -179,6 +182,116 @@ def _project_pca(features: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return projection.astype(np.float32, copy=False), explained.astype(np.float32, copy=False)
 
 
+def _spectral_layout(affinity: sparse.spmatrix, random_seed: int) -> np.ndarray:
+    num_points = int(affinity.shape[0])
+    if num_points == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    if num_points == 1:
+        return np.zeros((1, 2), dtype=np.float32)
+
+    degree = np.asarray(affinity.sum(axis=1)).reshape(-1)
+    if float(degree.max(initial=0.0)) <= 1e-12:
+        return np.zeros((num_points, 2), dtype=np.float32)
+
+    laplacian = sparse.csgraph.laplacian(affinity, normed=True)
+    max_components = min(num_points - 1, 4)
+    if max_components <= 0:
+        return np.zeros((num_points, 2), dtype=np.float32)
+    try:
+        eigenvalues, eigenvectors = sparse_linalg.eigsh(
+            laplacian,
+            k=max_components,
+            which="SM",
+        )
+        order = np.argsort(np.real(eigenvalues))
+        eigenvectors = np.real(eigenvectors[:, order])
+    except Exception:
+        lap_dense = laplacian.toarray()
+        eigenvalues, eigenvectors = np.linalg.eigh(lap_dense)
+        order = np.argsort(np.real(eigenvalues))
+        eigenvectors = np.real(eigenvectors[:, order[: max_components + 1]])
+
+    usable = eigenvectors[:, 1:3]
+    if usable.shape[1] < 2:
+        usable = np.pad(usable, ((0, 0), (0, 2 - usable.shape[1])), constant_values=0.0)
+    layout = usable.astype(np.float64, copy=False)
+    layout -= layout.mean(axis=0, keepdims=True)
+    scale = np.maximum(layout.std(axis=0, keepdims=True), 1e-6)
+    layout = layout / scale
+
+    rng = np.random.default_rng(random_seed)
+    layout += rng.normal(scale=0.01, size=layout.shape)
+    return layout.astype(np.float32, copy=False)
+
+
+def _project_umap_like(
+    features: np.ndarray,
+    n_neighbors: int = 12,
+    random_seed: int = 42,
+) -> np.ndarray:
+    if features.ndim != 2:
+        raise ValueError("features must be a 2D array")
+    num_points = int(features.shape[0])
+    if num_points == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    if num_points == 1:
+        return np.zeros((1, 2), dtype=np.float32)
+
+    k = max(1, min(int(n_neighbors), num_points - 1))
+    dense_features = features.astype(np.float64, copy=False)
+    pairwise = distance.cdist(dense_features, dense_features, metric="euclidean")
+
+    row_indices: list[int] = []
+    col_indices: list[int] = []
+    data_values: list[float] = []
+    for idx in range(num_points):
+        neighbor_order = np.argsort(pairwise[idx])[1 : k + 1]
+        local_distances = pairwise[idx, neighbor_order]
+        sigma = float(np.median(local_distances))
+        if sigma <= 1e-12:
+            sigma = float(np.max(local_distances))
+        sigma = max(sigma, 1e-6)
+        for neighbor, dist_value in zip(neighbor_order, local_distances, strict=False):
+            weight = math.exp(-(float(dist_value) ** 2) / (2.0 * sigma * sigma))
+            row_indices.append(idx)
+            col_indices.append(int(neighbor))
+            data_values.append(weight)
+
+    affinity = sparse.csr_matrix((data_values, (row_indices, col_indices)), shape=(num_points, num_points))
+    affinity = affinity.maximum(affinity.T)
+
+    if affinity.nnz == 0:
+        return _project_pca(features)[0]
+    return _spectral_layout(affinity=affinity, random_seed=random_seed)
+
+
+def _project_features(
+    features: np.ndarray,
+    method: str = "umap_like",
+    n_neighbors: int = 12,
+    random_seed: int = 42,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    method_key = str(method).lower()
+    if method_key == "pca":
+        projection, explained = _project_pca(features)
+        return projection, {
+            "title": f"Encoder latent PCA | PC1={explained[0] * 100:.1f}% PC2={explained[1] * 100:.1f}%",
+            "x_label": "PC1",
+            "y_label": "PC2",
+            "method_label": "pca",
+        }
+    if method_key not in {"umap_like", "umap-like"}:
+        raise ValueError(f"Unsupported latent projection method: {method}")
+    effective_neighbors = max(1, min(int(n_neighbors), max(features.shape[0] - 1, 1)))
+    projection = _project_umap_like(features, n_neighbors=n_neighbors, random_seed=random_seed)
+    return projection, {
+        "title": f"Encoder feature manifold | umap_like k={effective_neighbors}",
+        "x_label": "Embed-1",
+        "y_label": "Embed-2",
+        "method_label": "umap_like",
+    }
+
+
 def save_latent_space_plot(
     output_path: Path,
     model: MCMA,
@@ -192,6 +305,9 @@ def save_latent_space_plot(
     batch_size: int,
     device: torch.device,
     max_windows_per_signal: int = 24,
+    projection_method: str = "umap_like",
+    projection_neighbors: int = 12,
+    projection_seed: int = 42,
     dpi: int = 180,
 ) -> None:
     import matplotlib
@@ -232,7 +348,12 @@ def save_latent_space_plot(
         group_meta.append((family, lead_name, start_idx, start_idx + features.shape[0]))
 
     feature_matrix = np.concatenate(feature_blocks, axis=0)
-    projection, explained = _project_pca(feature_matrix)
+    projection, projection_meta = _project_features(
+        feature_matrix,
+        method=projection_method,
+        n_neighbors=projection_neighbors,
+        random_seed=projection_seed,
+    )
 
     lead_colors: dict[str, Any] = {"CH20": "black"}
     cmap = plt.get_cmap("tab10")
@@ -266,12 +387,9 @@ def save_latent_space_plot(
         centroid_features[(family, lead_name)] = feature_matrix[start_idx:stop_idx].mean(axis=0)
         centroid_proj[(family, lead_name)] = points.mean(axis=0)
 
-    scatter_ax.set_title(
-        f"Encoder latent PCA | PC1={explained[0] * 100:.1f}% PC2={explained[1] * 100:.1f}%",
-        fontsize=11,
-    )
-    scatter_ax.set_xlabel("PC1")
-    scatter_ax.set_ylabel("PC2")
+    scatter_ax.set_title(str(projection_meta["title"]), fontsize=11)
+    scatter_ax.set_xlabel(str(projection_meta["x_label"]))
+    scatter_ax.set_ylabel(str(projection_meta["y_label"]))
     scatter_ax.grid(alpha=0.2)
 
     family_handles = [
@@ -293,8 +411,8 @@ def save_latent_space_plot(
     scatter_ax.legend(handles=lead_handles, title="lead color", loc="lower right", ncol=2, fontsize=8)
 
     centroid_ax.set_title("Centroid Alignment", fontsize=11)
-    centroid_ax.set_xlabel("PC1")
-    centroid_ax.set_ylabel("PC2")
+    centroid_ax.set_xlabel(str(projection_meta["x_label"]))
+    centroid_ax.set_ylabel(str(projection_meta["y_label"]))
     centroid_ax.grid(alpha=0.2)
 
     upperarm_key = ("upperarm", "CH20")
@@ -337,7 +455,7 @@ def save_latent_space_plot(
     mean_cos = float(np.mean(finite_cosine_values)) if finite_cosine_values else float("nan")
     fig.suptitle(
         (
-            f"{record.path.name} | encoder feature space | windows/group={len(starts)} | "
+            f"{record.path.name} | encoder feature space | {projection_meta['method_label']} | windows/group={len(starts)} | "
             f"mean target-recon centroid l2={mean_l2:.3f} | mean cosine={mean_cos:.3f}"
         ),
         fontsize=12,
@@ -720,6 +838,9 @@ def main(argv: list[str] | None = None) -> int:
     latent_plot_dir = ensure_dir(latent_plot_dir_value) if latent_plot_dir_value else output_dir / "latent_plots"
     latent_max_windows_per_signal = int(reconstruct_cfg.get("latent_max_windows_per_signal", 24))
     latent_plot_dpi = int(reconstruct_cfg.get("latent_plot_dpi", max(plot_dpi, 180)))
+    latent_projection_method = str(reconstruct_cfg.get("latent_projection_method", "umap_like"))
+    latent_projection_neighbors = int(reconstruct_cfg.get("latent_projection_neighbors", 12))
+    latent_projection_seed = int(reconstruct_cfg.get("latent_projection_seed", config.get("seed", 42)))
 
     target_channels = list(data_cfg.get("target_channels") or [f"CH{i}" for i in range(1, 9)])
     records = load_upperarm_records(
@@ -826,6 +947,9 @@ def main(argv: list[str] | None = None) -> int:
                 batch_size=batch_size,
                 device=device,
                 max_windows_per_signal=latent_max_windows_per_signal,
+                projection_method=latent_projection_method,
+                projection_neighbors=latent_projection_neighbors,
+                projection_seed=latent_projection_seed,
                 dpi=latent_plot_dpi,
             )
             row["latent_plot_path"] = str(latent_plot_path)

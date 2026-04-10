@@ -167,6 +167,9 @@ def _evaluate_checkpoint_on_files(
     latent_plot_dir: Path | None = None,
     latent_max_windows_per_signal: int = 24,
     latent_plot_dpi: int = 180,
+    latent_projection_method: str = "umap_like",
+    latent_projection_neighbors: int = 12,
+    latent_projection_seed: int = 42,
 ) -> list[dict[str, object]]:
     data_cfg = config.get("data", {})
     model_cfg = config.get("model", {})
@@ -257,6 +260,9 @@ def _evaluate_checkpoint_on_files(
                 batch_size=batch_size,
                 device=device,
                 max_windows_per_signal=latent_max_windows_per_signal,
+                projection_method=latent_projection_method,
+                projection_neighbors=latent_projection_neighbors,
+                projection_seed=latent_projection_seed,
                 dpi=latent_plot_dpi,
             )
             row["latent_plot_path"] = str(latent_plot_path)
@@ -311,6 +317,9 @@ def main(argv: list[str] | None = None) -> int:
     save_latent_plots = bool(crossval_cfg.get("save_latent_plots", config.get("reconstruct", {}).get("save_latent_plots", True)))
     latent_max_windows_per_signal = int(crossval_cfg.get("latent_max_windows_per_signal", config.get("reconstruct", {}).get("latent_max_windows_per_signal", 24)))
     latent_plot_dpi = int(crossval_cfg.get("latent_plot_dpi", config.get("reconstruct", {}).get("latent_plot_dpi", max(plot_dpi, 180))))
+    latent_projection_method = str(crossval_cfg.get("latent_projection_method", config.get("reconstruct", {}).get("latent_projection_method", "umap_like")))
+    latent_projection_neighbors = int(crossval_cfg.get("latent_projection_neighbors", config.get("reconstruct", {}).get("latent_projection_neighbors", 12)))
+    latent_projection_seed = int(crossval_cfg.get("latent_projection_seed", config.get("reconstruct", {}).get("latent_projection_seed", config.get("seed", 42))))
 
     files = _discover_files(
         csv_dir=data_cfg["csv_dir"],
@@ -350,6 +359,9 @@ def main(argv: list[str] | None = None) -> int:
                 latent_plot_dir=(output_dir / f"fold_{fold_idx:02d}" / "zero_shot_latent") if save_latent_plots else None,
                 latent_max_windows_per_signal=latent_max_windows_per_signal,
                 latent_plot_dpi=latent_plot_dpi,
+                latent_projection_method=latent_projection_method,
+                latent_projection_neighbors=latent_projection_neighbors,
+                latent_projection_seed=latent_projection_seed,
             )
             for row in zero_shot_rows:
                 row["fold"] = fold_idx
@@ -401,6 +413,9 @@ def main(argv: list[str] | None = None) -> int:
             latent_plot_dir=(output_dir / f"fold_{fold_idx:02d}" / "fine_tuned_latent") if save_latent_plots else None,
             latent_max_windows_per_signal=latent_max_windows_per_signal,
             latent_plot_dpi=latent_plot_dpi,
+            latent_projection_method=latent_projection_method,
+            latent_projection_neighbors=latent_projection_neighbors,
+            latent_projection_seed=latent_projection_seed,
         )
         for row in fine_tuned_rows:
             row["fold"] = fold_idx
