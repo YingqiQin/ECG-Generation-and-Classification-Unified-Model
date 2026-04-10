@@ -1,0 +1,89 @@
+data:
+  dataset_type: upperarm_csv
+  csv_dir: null
+  file_glob: emg_data_*.csv
+  input_channel: CH20
+  target_channels: [CH1, CH2, CH3, CH4, CH5, CH6, CH7, CH8]
+  batch_size: 64
+  num_workers: 0
+  pin_memory: true
+  fs: 500
+  segment_length: 1024
+  segment_stride: 512
+  segment_policy: pad
+  padding_mode: zero
+  apply_filter: true
+  normalize_mode: zscore
+  fallback_fs: 1000.0
+  target_fs: 500.0
+  train_ratio: 0.8
+  val_ratio: 0.2
+  test_ratio: 0.0
+  split_seed: 42
+  max_files: null
+  split_files: null
+
+model:
+  kernel_size: 13
+  window_size: 2
+  filters: [16, 32, 64, 128, 256, 512]
+
+optim:
+  lr: 1e-3
+  weight_decay: 0
+  l1_weight: 0.0
+
+trainer:
+  epochs: 100
+  device: cuda
+  amp: true
+  grad_clip_norm: null
+  log_every: 50
+  eval_every: 1
+  ddp: false
+  deterministic: false
+  use_tensorboard: false
+
+seed: 42
+out_dir: artifacts/upperarm_mcma
+
+reconstruct:
+  output_dir: artifacts/upperarm_reconstruction
+  batch_size: 64
+  device: cuda
+  corr_method: pearson
+  save_plots: true
+  plot_dir: null
+  max_plot_samples: 4000
+  plot_dpi: 150
+  save_focus_plots: true
+  focus_plot_dir: null
+  focus_lead: null
+  focus_num_beats: 4
+  focus_window_ms: 900.0
+  focus_plot_dpi: 180
+  save_latent_plots: true
+  latent_plot_dir: null
+  latent_max_windows_per_signal: 24
+  latent_plot_dpi: 180
+  split: null
+  max_files: null
+
+crossval:
+  num_folds: 5
+  seed: 42
+  inner_val_ratio: 0.2
+  fine_tune_epochs: null
+  corr_method: pearson
+  save_plots: true
+  max_plot_samples: 4000
+  plot_dpi: 150
+  save_focus_plots: true
+  focus_lead: null
+  focus_num_beats: 4
+  focus_window_ms: 900.0
+  focus_plot_dpi: 180
+  save_latent_plots: true
+  latent_max_windows_per_signal: 24
+  latent_plot_dpi: 180
+  output_dir: artifacts/upperarm_crossval
