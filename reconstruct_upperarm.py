@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy import sparse
+from scipy import sparse, stats
 from scipy.sparse import linalg as sparse_linalg
 from scipy.spatial import distance
 import torch
@@ -272,6 +272,27 @@ def _project_features(
     random_seed: int = 42,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     method_key = str(method).lower()
+    effective_neighbors = max(1, min(int(n_neighbors), max(features.shape[0] - 1, 1)))
+    if method_key == "umap":
+        try:
+            import umap
+
+            reducer = umap.UMAP(
+                n_components=2,
+                n_neighbors=effective_neighbors,
+                min_dist=0.15,
+                metric="euclidean",
+                random_state=random_seed,
+            )
+            projection = reducer.fit_transform(features.astype(np.float32, copy=False))
+            return projection.astype(np.float32, copy=False), {
+                "title": f"Encoder feature manifold | umap k={effective_neighbors}",
+                "x_label": "UMAP-1",
+                "y_label": "UMAP-2",
+                "method_label": "umap",
+            }
+        except Exception:
+            method_key = "umap_like"
     if method_key == "pca":
         projection, explained = _project_pca(features)
         return projection, {
@@ -282,7 +303,6 @@ def _project_features(
         }
     if method_key not in {"umap_like", "umap-like"}:
         raise ValueError(f"Unsupported latent projection method: {method}")
-    effective_neighbors = max(1, min(int(n_neighbors), max(features.shape[0] - 1, 1)))
     projection = _project_umap_like(features, n_neighbors=n_neighbors, random_seed=random_seed)
     return projection, {
         "title": f"Encoder feature manifold | umap_like k={effective_neighbors}",
@@ -290,6 +310,46 @@ def _project_features(
         "y_label": "Embed-2",
         "method_label": "umap_like",
     }
+
+
+def _draw_density_cloud(ax: Any, points: np.ndarray, color: Any, alpha_fill: float = 0.10, alpha_line: float = 0.35) -> None:
+    if points.shape[0] < 5:
+        return
+    spread_x = float(np.ptp(points[:, 0]))
+    spread_y = float(np.ptp(points[:, 1]))
+    if spread_x <= 1e-6 and spread_y <= 1e-6:
+        return
+    try:
+        kde = stats.gaussian_kde(points.T)
+    except Exception:
+        return
+
+    x_min, x_max = float(points[:, 0].min()), float(points[:, 0].max())
+    y_min, y_max = float(points[:, 1].min()), float(points[:, 1].max())
+    x_pad = max(0.15 * max(x_max - x_min, 1e-3), 1e-3)
+    y_pad = max(0.15 * max(y_max - y_min, 1e-3), 1e-3)
+    grid_x, grid_y = np.mgrid[(x_min - x_pad):(x_max + x_pad):60j, (y_min - y_pad):(y_max + y_pad):60j]
+    grid = np.vstack([grid_x.ravel(), grid_y.ravel()])
+    density = kde(grid).reshape(grid_x.shape)
+    positive = density[density > 0]
+    if positive.size == 0:
+        return
+    levels = np.quantile(positive, [0.60, 0.80, 0.92])
+    levels = np.unique(levels)
+    if levels.size < 2:
+        return
+    ax.contourf(grid_x, grid_y, density, levels=levels, colors=[color], alpha=alpha_fill, antialiased=True)
+    ax.contour(grid_x, grid_y, density, levels=levels, colors=[color], linewidths=0.8, alpha=alpha_line)
+
+
+def _style_latent_axis(ax: Any, title: str, x_label: str, y_label: str, x_limits: tuple[float, float], y_limits: tuple[float, float]) -> None:
+    ax.set_title(title, fontsize=11)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel(y_label)
+    ax.set_xlim(*x_limits)
+    ax.set_ylim(*y_limits)
+    ax.set_aspect("equal", adjustable="box")
+    ax.grid(alpha=0.15, linewidth=0.6)
 
 
 def save_latent_space_plot(
@@ -359,88 +419,99 @@ def save_latent_space_plot(
     cmap = plt.get_cmap("tab10")
     for idx, lead_name in enumerate(target_channels):
         lead_colors[lead_name] = cmap(idx % 10)
-    family_markers = {
-        "upperarm": "X",
-        "target": "o",
-        "reconstructed": "^",
-    }
+    family_markers = {"upperarm": "X", "target": "o", "reconstructed": "^"}
 
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6))
-    scatter_ax, centroid_ax = axes
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.8))
+    reference_ax, upperarm_ax, recon_ax = axes
     centroid_features: dict[tuple[str, str], np.ndarray] = {}
     centroid_proj: dict[tuple[str, str], np.ndarray] = {}
+    group_points: dict[tuple[str, str], np.ndarray] = {}
 
     for family, lead_name, start_idx, stop_idx in group_meta:
         points = projection[start_idx:stop_idx]
         if points.shape[0] == 0:
             continue
-        color = lead_colors.get(lead_name, "gray")
-        scatter_ax.scatter(
-            points[:, 0],
-            points[:, 1],
-            s=22 if family != "upperarm" else 45,
-            alpha=0.45 if family != "upperarm" else 0.95,
-            c=[color],
-            marker=family_markers[family],
-            edgecolors="none",
-        )
+        group_points[(family, lead_name)] = points
         centroid_features[(family, lead_name)] = feature_matrix[start_idx:stop_idx].mean(axis=0)
         centroid_proj[(family, lead_name)] = points.mean(axis=0)
 
-    scatter_ax.set_title(str(projection_meta["title"]), fontsize=11)
-    scatter_ax.set_xlabel(str(projection_meta["x_label"]))
-    scatter_ax.set_ylabel(str(projection_meta["y_label"]))
-    scatter_ax.grid(alpha=0.2)
+    if projection.shape[0] == 0:
+        x_limits = (-1.0, 1.0)
+        y_limits = (-1.0, 1.0)
+    else:
+        x_min, x_max = float(projection[:, 0].min()), float(projection[:, 0].max())
+        y_min, y_max = float(projection[:, 1].min()), float(projection[:, 1].max())
+        x_pad = max(0.08 * max(x_max - x_min, 1e-3), 0.05)
+        y_pad = max(0.08 * max(y_max - y_min, 1e-3), 0.05)
+        x_limits = (x_min - x_pad, x_max + x_pad)
+        y_limits = (y_min - y_pad, y_max + y_pad)
 
-    family_handles = [
-        Line2D([0], [0], marker=family_markers["upperarm"], color="black", linestyle="none", markersize=8, label="upperarm"),
-        Line2D([0], [0], marker=family_markers["target"], color="black", linestyle="none", markersize=8, label="target"),
-        Line2D([0], [0], marker=family_markers["reconstructed"], color="black", linestyle="none", markersize=8, label="reconstructed"),
-    ]
-    lead_handles = [
-        Line2D([0], [0], marker="o", color=lead_colors["CH20"], linestyle="none", markersize=7, label="CH20")
-    ]
-    lead_handles.extend(
-        [
-            Line2D([0], [0], marker="o", color=lead_colors[lead_name], linestyle="none", markersize=7, label=lead_name)
-            for lead_name in target_channels
-        ]
-    )
-    legend_family = scatter_ax.legend(handles=family_handles, title="family", loc="upper right")
-    scatter_ax.add_artist(legend_family)
-    scatter_ax.legend(handles=lead_handles, title="lead color", loc="lower right", ncol=2, fontsize=8)
+    for lead_name in target_channels:
+        target_key = ("target", lead_name)
+        if target_key not in group_points:
+            continue
+        points = group_points[target_key]
+        color = lead_colors[lead_name]
+        _draw_density_cloud(reference_ax, points, color=color, alpha_fill=0.10, alpha_line=0.40)
+        reference_ax.scatter(points[:, 0], points[:, 1], s=15, c=[color], alpha=0.30, marker="o", edgecolors="none")
+        centroid = centroid_proj[target_key]
+        reference_ax.scatter(centroid[0], centroid[1], s=60, c=[color], marker="o", edgecolors="white", linewidths=0.5)
+        reference_ax.annotate(lead_name, (centroid[0], centroid[1]), textcoords="offset points", xytext=(4, 4), fontsize=8, color=color)
 
-    centroid_ax.set_title("Centroid Alignment", fontsize=11)
-    centroid_ax.set_xlabel(str(projection_meta["x_label"]))
-    centroid_ax.set_ylabel(str(projection_meta["y_label"]))
-    centroid_ax.grid(alpha=0.2)
+    for lead_name in target_channels:
+        target_key = ("target", lead_name)
+        if target_key not in group_points:
+            continue
+        points = group_points[target_key]
+        upperarm_ax.scatter(points[:, 0], points[:, 1], s=10, c=[lead_colors[lead_name]], alpha=0.10, marker="o", edgecolors="none")
+        centroid = centroid_proj[target_key]
+        upperarm_ax.scatter(centroid[0], centroid[1], s=36, c=[lead_colors[lead_name]], alpha=0.80, marker="o", edgecolors="white", linewidths=0.4)
 
     upperarm_key = ("upperarm", "CH20")
     if upperarm_key in centroid_proj:
-        point = centroid_proj[upperarm_key]
-        centroid_ax.scatter(point[0], point[1], c=[lead_colors["CH20"]], marker=family_markers["upperarm"], s=120)
-        centroid_ax.annotate("CH20-U", (point[0], point[1]), textcoords="offset points", xytext=(6, 6), fontsize=9)
+        upperarm_points = group_points.get(upperarm_key)
+        if upperarm_points is not None:
+            _draw_density_cloud(upperarm_ax, upperarm_points, color="black", alpha_fill=0.12, alpha_line=0.30)
+            upperarm_ax.scatter(upperarm_points[:, 0], upperarm_points[:, 1], s=24, c="black", alpha=0.75, marker="X", linewidths=0.0)
+        upperarm_point = centroid_proj[upperarm_key]
+        upperarm_ax.scatter(upperarm_point[0], upperarm_point[1], c=[lead_colors["CH20"]], marker="X", s=120)
+        upperarm_ax.annotate("CH20", (upperarm_point[0], upperarm_point[1]), textcoords="offset points", xytext=(6, 6), fontsize=9, color="black")
 
     mean_cosine_values: list[float] = []
     mean_l2_values: list[float] = []
+    upperarm_distances: list[tuple[float, str]] = []
     for lead_name in target_channels:
         target_key = ("target", lead_name)
         recon_key = ("reconstructed", lead_name)
-        if target_key not in centroid_proj or recon_key not in centroid_proj:
+        if target_key in group_points:
+            target_points = group_points[target_key]
+            recon_ax.scatter(target_points[:, 0], target_points[:, 1], s=10, c=[lead_colors[lead_name]], alpha=0.10, marker="o", edgecolors="none")
+            _draw_density_cloud(recon_ax, target_points, color=lead_colors[lead_name], alpha_fill=0.05, alpha_line=0.20)
+        if target_key not in centroid_proj:
+            continue
+        if upperarm_key in centroid_features:
+            upperarm_feature = centroid_features[upperarm_key]
+            target_feature = centroid_features[target_key]
+            upperarm_distances.append((float(np.linalg.norm(upperarm_feature - target_feature)), lead_name))
+        if recon_key not in centroid_proj:
             continue
         target_point = centroid_proj[target_key]
         recon_point = centroid_proj[recon_key]
-        centroid_ax.plot(
-            [target_point[0], recon_point[0]],
-            [target_point[1], recon_point[1]],
-            color=lead_colors[lead_name],
-            linewidth=1.2,
-            alpha=0.8,
-        )
-        centroid_ax.scatter(target_point[0], target_point[1], c=[lead_colors[lead_name]], marker=family_markers["target"], s=80)
-        centroid_ax.scatter(recon_point[0], recon_point[1], c=[lead_colors[lead_name]], marker=family_markers["reconstructed"], s=80)
-        centroid_ax.annotate(f"{lead_name}-T", (target_point[0], target_point[1]), textcoords="offset points", xytext=(4, 4), fontsize=8)
-        centroid_ax.annotate(f"{lead_name}-R", (recon_point[0], recon_point[1]), textcoords="offset points", xytext=(4, -10), fontsize=8)
+        recon_points = group_points.get(recon_key)
+        if recon_points is not None:
+            recon_ax.scatter(
+                recon_points[:, 0],
+                recon_points[:, 1],
+                s=24,
+                facecolors="none",
+                edgecolors=[lead_colors[lead_name]],
+                alpha=0.75,
+                marker="^",
+                linewidths=0.9,
+            )
+        recon_ax.plot([target_point[0], recon_point[0]], [target_point[1], recon_point[1]], color=lead_colors[lead_name], linewidth=1.2, alpha=0.85)
+        recon_ax.scatter(target_point[0], target_point[1], c=[lead_colors[lead_name]], marker="o", s=52, edgecolors="white", linewidths=0.4)
+        recon_ax.scatter(recon_point[0], recon_point[1], facecolors="white", edgecolors=[lead_colors[lead_name]], marker="^", s=70, linewidths=1.1)
 
         target_feature = centroid_features[target_key]
         recon_feature = centroid_features[recon_key]
@@ -450,19 +521,55 @@ def save_latent_space_plot(
         mean_l2_values.append(l2_value)
         mean_cosine_values.append(cosine_value)
 
+    if upperarm_key in centroid_proj and upperarm_distances:
+        best_upperarm_distance, best_upperarm_lead = min(upperarm_distances, key=lambda item: item[0])
+        best_target_point = centroid_proj[("target", best_upperarm_lead)]
+        upperarm_point = centroid_proj[upperarm_key]
+        upperarm_ax.plot(
+            [upperarm_point[0], best_target_point[0]],
+            [upperarm_point[1], best_target_point[1]],
+            color=lead_colors[best_upperarm_lead],
+            linestyle="--",
+            linewidth=1.4,
+            alpha=0.90,
+        )
+        upperarm_ax.annotate(
+            f"nearest target: {best_upperarm_lead}\nlatent l2={best_upperarm_distance:.3f}",
+            (upperarm_point[0], upperarm_point[1]),
+            textcoords="offset points",
+            xytext=(10, -30),
+            fontsize=8.5,
+            bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": "#cccccc", "alpha": 0.9},
+        )
+
     finite_cosine_values = [value for value in mean_cosine_values if not math.isnan(value)]
     mean_l2 = float(np.mean(mean_l2_values)) if mean_l2_values else float("nan")
     mean_cos = float(np.mean(finite_cosine_values)) if finite_cosine_values else float("nan")
+    x_label = str(projection_meta["x_label"])
+    y_label = str(projection_meta["y_label"])
+    _style_latent_axis(reference_ax, f"Reference Leads | {projection_meta['method_label']}", x_label, y_label, x_limits, y_limits)
+    _style_latent_axis(upperarm_ax, "Upper-Arm vs Reference", x_label, y_label, x_limits, y_limits)
+    _style_latent_axis(recon_ax, "Reconstruction vs Reference", x_label, y_label, x_limits, y_limits)
+
+    family_handles = [
+        Line2D([0], [0], marker="o", color="black", linestyle="none", markersize=7, label="target centroid"),
+        Line2D([0], [0], marker="X", color="black", linestyle="none", markersize=8, label="upper-arm windows"),
+        Line2D([0], [0], marker="^", markerfacecolor="white", markeredgecolor="black", linestyle="none", markersize=8, label="reconstructed windows"),
+    ]
+    lead_handles = [Line2D([0], [0], marker="o", color=lead_colors[lead_name], linestyle="none", markersize=7, label=lead_name) for lead_name in target_channels]
+    recon_ax.legend(handles=family_handles, loc="upper right", fontsize=8, frameon=True)
+    fig.legend(handles=lead_handles, loc="lower center", ncol=min(4, len(target_channels)), fontsize=8, frameon=False, bbox_to_anchor=(0.5, -0.02))
+
     fig.suptitle(
         (
-            f"{record.path.name} | encoder feature space | {projection_meta['method_label']} | windows/group={len(starts)} | "
+            f"{record.path.name} | encoder feature map | {projection_meta['method_label']} | windows/group={len(starts)} | "
             f"mean target-recon centroid l2={mean_l2:.3f} | mean cosine={mean_cos:.3f}"
         ),
         fontsize=12,
         y=1.02,
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.05, 1.0, 0.98))
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
 
