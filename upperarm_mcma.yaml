@@ -65,7 +65,7 @@ reconstruct:
   save_latent_plots: true
   latent_plot_dir: null
   latent_max_windows_per_signal: 24
-  latent_projection_method: umap_like
+  latent_projection_method: umap
   latent_projection_neighbors: 12
   latent_projection_seed: 42
   latent_plot_dpi: 180
@@ -88,7 +88,7 @@ crossval:
   focus_plot_dpi: 180
   save_latent_plots: true
   latent_max_windows_per_signal: 24
-  latent_projection_method: umap_like
+  latent_projection_method: umap
   latent_projection_neighbors: 12
   latent_projection_seed: 42
   latent_plot_dpi: 180
