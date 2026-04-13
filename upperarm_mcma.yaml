@@ -93,3 +93,13 @@ crossval:
   latent_projection_seed: 42
   latent_plot_dpi: 180
   output_dir: artifacts/upperarm_crossval
+
+subject_protocol:
+  subject_root_dir: null
+  subject_dir_glob: "*"
+  output_dir: artifacts/upperarm_subject_protocol
+  run_per_subject_cv: true
+  run_cross_subject: true
+  min_files_per_subject: 2
+  cross_subject_val_ratio: 0.2
+  cross_subject_fine_tune_epochs: null
