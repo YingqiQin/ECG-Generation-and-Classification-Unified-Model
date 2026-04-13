@@ -56,6 +56,7 @@ reconstruct:
   plot_dir: null
   max_plot_samples: 4000
   plot_dpi: 150
+  visual_filter_mode: recon_only
   save_focus_plots: true
   focus_plot_dir: null
   focus_lead: null
@@ -69,6 +70,9 @@ reconstruct:
   latent_projection_neighbors: 12
   latent_projection_seed: 42
   latent_plot_dpi: 180
+  lag_search_window_ms: 150.0
+  dtw_max_points: 2000
+  rpeak_tolerance_ms: 120.0
   split: null
   max_files: null
 
