@@ -131,6 +131,8 @@ def _build_fieldnames(target_channels: list[str], corr_method: str) -> list[str]
         "original_sampling_rate_hz",
         "effective_sampling_rate_hz",
         "corr_method",
+        "lag_search_window_ms",
+        "rpeak_tolerance_ms",
         "plot_path",
         "focus_lead",
         "focus_plot_path",
@@ -145,9 +147,33 @@ def _build_fieldnames(target_channels: list[str], corr_method: str) -> list[str]
                 f"{lead_name}_mae",
                 f"{lead_name}_rmse",
                 f"{lead_name}_{corr_method}",
+                f"{lead_name}_max_xcorr",
+                f"{lead_name}_best_lag_samples",
+                f"{lead_name}_best_lag_ms",
+                f"{lead_name}_lag_corrected_{corr_method}",
+                f"{lead_name}_lag_corrected_rmse",
+                f"{lead_name}_lag_corrected_mae",
+                f"{lead_name}_dtw_distance",
+                f"{lead_name}_lag_corrected_rpeak_timing_mae_ms",
+                f"{lead_name}_lag_corrected_rpeak_match_fraction",
             ]
         )
-    fieldnames.extend(["mean_mse", "mean_mae", "mean_rmse", f"mean_{corr_method}"])
+    fieldnames.extend(
+        [
+            "mean_mse",
+            "mean_mae",
+            "mean_rmse",
+            f"mean_{corr_method}",
+            "mean_max_xcorr",
+            "mean_abs_best_lag_ms",
+            f"mean_lag_corrected_{corr_method}",
+            "mean_lag_corrected_rmse",
+            "mean_lag_corrected_mae",
+            "mean_dtw_distance",
+            "mean_lag_corrected_rpeak_timing_mae_ms",
+            "mean_lag_corrected_rpeak_match_fraction",
+        ]
+    )
     return fieldnames
 
 
@@ -189,6 +215,10 @@ def _evaluate_checkpoint_on_files(
     segment_policy = data_cfg.get("segment_policy", "pad")
     padding_mode = data_cfg.get("padding_mode", "zero")
     batch_size = int(reconstruct_cfg.get("batch_size", data_cfg.get("batch_size", 64)))
+    lag_search_window_ms = float(reconstruct_cfg.get("lag_search_window_ms", 150.0))
+    dtw_max_points = int(reconstruct_cfg.get("dtw_max_points", 2000))
+    rpeak_tolerance_ms = float(reconstruct_cfg.get("rpeak_tolerance_ms", 120.0))
+    visual_filter_mode = str(reconstruct_cfg.get("visual_filter_mode", "recon_only"))
 
     rows: list[dict[str, object]] = []
     for path in files:
@@ -216,6 +246,9 @@ def _evaluate_checkpoint_on_files(
             target_channels=target_channels,
             reconstructed=reconstructed,
             corr_method=corr_method,
+            lag_search_window_ms=lag_search_window_ms,
+            dtw_max_points=dtw_max_points,
+            rpeak_tolerance_ms=rpeak_tolerance_ms,
         )
         if plot_dir is not None:
             plot_path = plot_dir / f"{path.stem}_comparison.png"
@@ -225,6 +258,7 @@ def _evaluate_checkpoint_on_files(
                 target_channels=target_channels,
                 reconstructed=reconstructed,
                 metrics_row=row,
+                visual_filter_mode=visual_filter_mode,
                 max_plot_samples=max_plot_samples,
                 dpi=plot_dpi,
             )
@@ -238,6 +272,7 @@ def _evaluate_checkpoint_on_files(
                 reconstructed=reconstructed,
                 metrics_row=row,
                 focus_lead=focus_lead,
+                visual_filter_mode=visual_filter_mode,
                 num_beats=focus_num_beats,
                 window_ms=focus_window_ms,
                 max_plot_samples=max_plot_samples,
@@ -275,7 +310,20 @@ def _evaluate_checkpoint_on_files(
 def _summarize_rows(rows: list[dict[str, object]], corr_method: str) -> list[dict[str, object]]:
     if not rows:
         return []
-    metrics = ["mean_mse", "mean_mae", "mean_rmse", f"mean_{corr_method}"]
+    metrics = [
+        "mean_mse",
+        "mean_mae",
+        "mean_rmse",
+        f"mean_{corr_method}",
+        "mean_max_xcorr",
+        "mean_abs_best_lag_ms",
+        f"mean_lag_corrected_{corr_method}",
+        "mean_lag_corrected_rmse",
+        "mean_lag_corrected_mae",
+        "mean_dtw_distance",
+        "mean_lag_corrected_rpeak_timing_mae_ms",
+        "mean_lag_corrected_rpeak_match_fraction",
+    ]
     summaries: list[dict[str, object]] = []
     for stage in sorted({str(row["stage"]) for row in rows}):
         stage_rows = [row for row in rows if row["stage"] == stage]
@@ -429,7 +477,21 @@ def main(argv: list[str] | None = None) -> int:
 
     summaries = _summarize_rows(all_rows, corr_method=corr_method)
     summary_fields = ["stage", "num_files"]
-    for metric in ["mean_mse", "mean_mae", "mean_rmse", f"mean_{corr_method}"]:
+    summary_metrics = [
+        "mean_mse",
+        "mean_mae",
+        "mean_rmse",
+        f"mean_{corr_method}",
+        "mean_max_xcorr",
+        "mean_abs_best_lag_ms",
+        f"mean_lag_corrected_{corr_method}",
+        "mean_lag_corrected_rmse",
+        "mean_lag_corrected_mae",
+        "mean_dtw_distance",
+        "mean_lag_corrected_rpeak_timing_mae_ms",
+        "mean_lag_corrected_rpeak_match_fraction",
+    ]
+    for metric in summary_metrics:
         summary_fields.extend([f"{metric}_mean", f"{metric}_std"])
     _append_csv(summary_path, summaries, fieldnames=summary_fields)
     return 0

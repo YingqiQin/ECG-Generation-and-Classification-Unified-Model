@@ -15,6 +15,7 @@ import torch
 
 from mcma_torch.data.upperarm_csv import (
     PreparedUpperArmRecord,
+    _filter_signal,
     aggregate_window_predictions,
     compute_window_starts,
     load_upperarm_records,
@@ -95,6 +96,156 @@ def _corr(x: np.ndarray, y: np.ndarray, method: str = "pearson") -> float:
     if float(x_series.std(ddof=0)) <= 1e-12 or float(y_series.std(ddof=0)) <= 1e-12:
         return float("nan")
     return float(x_series.corr(y_series, method=method))
+
+
+def _overlap_with_lag(target: np.ndarray, pred: np.ndarray, lag_samples: int) -> tuple[np.ndarray, np.ndarray]:
+    if target.shape != pred.shape:
+        raise ValueError("Lag alignment requires equal-length arrays")
+    if lag_samples > 0:
+        return target[:-lag_samples], pred[lag_samples:]
+    if lag_samples < 0:
+        return target[-lag_samples:], pred[:lag_samples]
+    return target, pred
+
+
+def _shift_for_plot(signal: np.ndarray, lag_samples: int) -> np.ndarray:
+    shifted = np.full(signal.shape, np.nan, dtype=np.float32)
+    if lag_samples > 0:
+        shifted[:-lag_samples] = signal[lag_samples:]
+        return shifted
+    if lag_samples < 0:
+        shifted[-lag_samples:] = signal[:lag_samples]
+        return shifted
+    return signal.astype(np.float32, copy=False)
+
+
+def _prepare_display_signals(
+    target: np.ndarray,
+    pred: np.ndarray,
+    sampling_rate_hz: float,
+    visual_filter_mode: str,
+) -> tuple[np.ndarray, np.ndarray, str, str]:
+    mode = str(visual_filter_mode).strip().lower()
+    target_display = target.astype(np.float32, copy=False)
+    pred_display = pred.astype(np.float32, copy=False)
+    target_label = "target (eval-domain)"
+    pred_label = "reconstructed"
+
+    if mode in {"none", "raw"}:
+        return target_display, pred_display, target_label, pred_label
+    if mode == "recon_only":
+        pred_display = _filter_signal(pred_display, sampling_rate_hz=sampling_rate_hz)
+        pred_label = "reconstructed (display-filtered)"
+        return target_display, pred_display, target_label, pred_label
+    if mode == "both":
+        target_display = _filter_signal(target_display, sampling_rate_hz=sampling_rate_hz)
+        pred_display = _filter_signal(pred_display, sampling_rate_hz=sampling_rate_hz)
+        target_label = "target (display-filtered eval-domain)"
+        pred_label = "reconstructed (display-filtered)"
+        return target_display, pred_display, target_label, pred_label
+    raise ValueError(f"Unsupported visual_filter_mode: {visual_filter_mode}")
+
+
+def _bounded_xcorr_metrics(
+    target: np.ndarray,
+    pred: np.ndarray,
+    sampling_rate_hz: float,
+    corr_method: str,
+    max_lag_ms: float,
+) -> dict[str, float]:
+    max_lag_samples = max(0, int(round(max_lag_ms * sampling_rate_hz / 1000.0)))
+    best_corr = -float("inf")
+    best_lag = 0
+    for lag_samples in range(-max_lag_samples, max_lag_samples + 1):
+        target_seg, pred_seg = _overlap_with_lag(target=target, pred=pred, lag_samples=lag_samples)
+        if target_seg.size < 8:
+            continue
+        corr_value = _corr(pred_seg, target_seg, method=corr_method)
+        if math.isnan(corr_value):
+            continue
+        if corr_value > best_corr:
+            best_corr = corr_value
+            best_lag = lag_samples
+
+    if best_corr == -float("inf"):
+        best_corr = float("nan")
+        best_lag = 0
+    target_aligned, pred_aligned = _overlap_with_lag(target=target, pred=pred, lag_samples=best_lag)
+    if target_aligned.size == 0:
+        lag_rmse = float("nan")
+        lag_mae = float("nan")
+        lag_corr = float("nan")
+    else:
+        lag_mse = float(np.mean((pred_aligned - target_aligned) ** 2))
+        lag_rmse = float(np.sqrt(lag_mse))
+        lag_mae = float(np.mean(np.abs(pred_aligned - target_aligned)))
+        lag_corr = _corr(pred_aligned, target_aligned, method=corr_method)
+    return {
+        "best_lag_samples": float(best_lag),
+        "best_lag_ms": float(best_lag) * 1000.0 / max(sampling_rate_hz, 1e-6),
+        "max_xcorr": float(best_corr),
+        f"lag_corrected_{corr_method}": float(lag_corr),
+        "lag_corrected_rmse": float(lag_rmse),
+        "lag_corrected_mae": float(lag_mae),
+    }
+
+
+def _downsample_for_dtw(signal: np.ndarray, max_points: int) -> np.ndarray:
+    if max_points <= 0 or signal.size <= max_points:
+        return signal.astype(np.float32, copy=False)
+    stride = int(math.ceil(signal.size / max_points))
+    return signal[::stride].astype(np.float32, copy=False)
+
+
+def _banded_dtw_distance(target: np.ndarray, pred: np.ndarray, band_radius: int) -> float:
+    if target.size == 0 or pred.size == 0:
+        return float("nan")
+    n = int(target.size)
+    m = int(pred.size)
+    radius = max(int(band_radius), abs(n - m))
+    previous = np.full((m + 1,), np.inf, dtype=np.float64)
+    previous[0] = 0.0
+    for i in range(1, n + 1):
+        current = np.full((m + 1,), np.inf, dtype=np.float64)
+        j_start = max(1, i - radius)
+        j_stop = min(m, i + radius)
+        for j in range(j_start, j_stop + 1):
+            cost = abs(float(target[i - 1]) - float(pred[j - 1]))
+            current[j] = cost + min(previous[j], current[j - 1], previous[j - 1])
+        previous = current
+    if not np.isfinite(previous[m]):
+        return float("nan")
+    return float(previous[m] / max(n, m))
+
+
+def _match_rpeak_mae_ms(
+    target: np.ndarray,
+    pred: np.ndarray,
+    sampling_rate_hz: float,
+    tolerance_ms: float,
+) -> tuple[float, float]:
+    target_peaks = _find_peak_indices(target, sampling_rate_hz=sampling_rate_hz)
+    pred_peaks = _find_peak_indices(pred, sampling_rate_hz=sampling_rate_hz)
+    if target_peaks.size == 0 or pred_peaks.size == 0:
+        return float("nan"), float("nan")
+
+    tolerance_samples = max(1, int(round(tolerance_ms * sampling_rate_hz / 1000.0)))
+    pred_cursor = 0
+    errors_ms: list[float] = []
+    for target_peak in target_peaks:
+        while pred_cursor + 1 < pred_peaks.size and pred_peaks[pred_cursor + 1] <= target_peak:
+            pred_cursor += 1
+        candidate_indices = {pred_cursor}
+        if pred_cursor + 1 < pred_peaks.size:
+            candidate_indices.add(pred_cursor + 1)
+        best_error = min(abs(int(target_peak) - int(pred_peaks[idx])) for idx in candidate_indices)
+        if best_error <= tolerance_samples:
+            errors_ms.append(best_error * 1000.0 / max(sampling_rate_hz, 1e-6))
+
+    matched_fraction = float(len(errors_ms) / max(target_peaks.size, 1))
+    if not errors_ms:
+        return float("nan"), matched_fraction
+    return float(np.mean(errors_ms)), matched_fraction
 
 
 def _write_reconstruction_csv(
@@ -647,6 +798,7 @@ def save_reconstruction_comparison_plot(
     target_channels: list[str],
     reconstructed: np.ndarray,
     metrics_row: dict[str, object],
+    visual_filter_mode: str = "recon_only",
     max_plot_samples: int = 4000,
     dpi: int = 150,
 ) -> None:
@@ -671,15 +823,29 @@ def save_reconstruction_comparison_plot(
     corr_method = str(metrics_row.get("corr_method", "pearson"))
     for lead_idx, lead_name in enumerate(target_channels):
         ax = axes_array[lead_idx]
-        target = record.target_signals[lead_idx][::stride]
-        pred = reconstructed[lead_idx][::stride]
-        ax.plot(time_plot, target, color="black", linewidth=1.0, label="target (eval-domain)")
-        ax.plot(time_plot, pred, color="red", linewidth=1.0, alpha=0.8, label="reconstructed")
+        target_display, pred_display, target_label, pred_label = _prepare_display_signals(
+            target=record.target_signals[lead_idx],
+            pred=reconstructed[lead_idx],
+            sampling_rate_hz=float(record.sampling_rate_hz),
+            visual_filter_mode=visual_filter_mode,
+        )
+        target = target_display[::stride]
+        pred = pred_display[::stride]
+        lag_samples = int(round(float(metrics_row.get(f"{lead_name}_best_lag_samples", 0.0))))
+        pred_shifted = _shift_for_plot(pred_display, lag_samples)[::stride]
+        ax.plot(time_plot, target, color="black", linewidth=1.0, label=target_label)
+        ax.plot(time_plot, pred, color="red", linewidth=1.0, alpha=0.8, label=pred_label)
+        ax.plot(time_plot, pred_shifted, color="#1f77b4", linewidth=1.0, alpha=0.85, linestyle="--", label="lag-corrected recon")
         corr_value = float(metrics_row.get(f"{lead_name}_{corr_method}", float("nan")))
+        lag_corr_value = float(metrics_row.get(f"{lead_name}_lag_corrected_{corr_method}", float("nan")))
+        lag_ms_value = float(metrics_row.get(f"{lead_name}_best_lag_ms", float("nan")))
         rmse_value = float(metrics_row.get(f"{lead_name}_rmse", float("nan")))
-        mae_value = float(metrics_row.get(f"{lead_name}_mae", float("nan")))
+        lag_rmse_value = float(metrics_row.get(f"{lead_name}_lag_corrected_rmse", float("nan")))
         ax.set_title(
-            f"{lead_name} | {corr_method}={corr_value:.3f} | rmse={rmse_value:.3f} | mae={mae_value:.3f}",
+            (
+                f"{lead_name} | raw {corr_method}={corr_value:.3f} | lag {lag_ms_value:.1f} ms | "
+                f"lag-{corr_method}={lag_corr_value:.3f} | raw/lag-rmse={rmse_value:.3f}/{lag_rmse_value:.3f}"
+            ),
             fontsize=10,
         )
         ax.grid(alpha=0.2)
@@ -696,8 +862,9 @@ def save_reconstruction_comparison_plot(
         (
             f"{record.path.name} | original_fs={record.original_sampling_rate_hz:.1f} Hz "
             f"-> eval_fs={record.sampling_rate_hz:.1f} Hz | "
-            f"mean_{corr_method}={float(metrics_row[f'mean_{corr_method}']):.3f} | "
-            f"mean_rmse={float(metrics_row['mean_rmse']):.3f} | eval-domain comparison"
+            f"mean raw {corr_method}={float(metrics_row[f'mean_{corr_method}']):.3f} | "
+            f"mean lag-{corr_method}={float(metrics_row[f'mean_lag_corrected_{corr_method}']):.3f} | "
+            f"mean |lag|={float(metrics_row['mean_abs_best_lag_ms']):.1f} ms"
         ),
         fontsize=12,
         y=1.01,
@@ -715,6 +882,7 @@ def save_focus_lead_plot(
     reconstructed: np.ndarray,
     metrics_row: dict[str, object],
     focus_lead: str | None = None,
+    visual_filter_mode: str = "recon_only",
     num_beats: int = 4,
     window_ms: float = 900.0,
     max_plot_samples: int = 4000,
@@ -734,8 +902,12 @@ def save_focus_lead_plot(
     )
 
     time_s = (record.timestamps_ms.astype(np.float64) - float(record.timestamps_ms[0])) / 1000.0
-    target = record.target_signals[lead_idx]
-    pred = reconstructed[lead_idx]
+    target, pred, target_label, pred_label = _prepare_display_signals(
+        target=record.target_signals[lead_idx],
+        pred=reconstructed[lead_idx],
+        sampling_rate_hz=float(record.sampling_rate_hz),
+        visual_filter_mode=visual_filter_mode,
+    )
     sampling_rate_hz = max(float(record.sampling_rate_hz), 1.0)
     half_window_samples = max(8, int(round((window_ms / 1000.0) * sampling_rate_hz / 2.0)))
     centers = _select_focus_centers(
@@ -762,8 +934,11 @@ def save_focus_lead_plot(
     axes_array = np.atleast_1d(axes).reshape(-1)
 
     overview_ax = axes_array[0]
-    overview_ax.plot(time_s[::overview_stride], target[::overview_stride], color="black", linewidth=1.0, label="target (eval-domain)")
-    overview_ax.plot(time_s[::overview_stride], pred[::overview_stride], color="red", linewidth=1.0, alpha=0.8, label="reconstructed")
+    lag_samples = int(round(float(metrics_row.get(f"{lead_name}_best_lag_samples", 0.0))))
+    pred_shifted = _shift_for_plot(pred, lag_samples)
+    overview_ax.plot(time_s[::overview_stride], target[::overview_stride], color="black", linewidth=1.0, label=target_label)
+    overview_ax.plot(time_s[::overview_stride], pred[::overview_stride], color="red", linewidth=1.0, alpha=0.8, label=pred_label)
+    overview_ax.plot(time_s[::overview_stride], pred_shifted[::overview_stride], color="#1f77b4", linewidth=1.0, alpha=0.85, linestyle="--", label="lag-corrected recon")
     for center in centers:
         left = max(0, int(center) - half_window_samples)
         right = min(target.shape[0], int(center) + half_window_samples)
@@ -772,8 +947,10 @@ def save_focus_lead_plot(
     overview_ax.grid(alpha=0.2)
     overview_ax.set_title(
         (
-            f"{lead_name} full trace | {corr_method}={float(metrics_row[f'{lead_name}_{corr_method}']):.3f} | "
-            f"rmse={float(metrics_row[f'{lead_name}_rmse']):.3f} | mae={float(metrics_row[f'{lead_name}_mae']):.3f}"
+            f"{lead_name} full trace | raw {corr_method}={float(metrics_row[f'{lead_name}_{corr_method}']):.3f} | "
+            f"lag={float(metrics_row[f'{lead_name}_best_lag_ms']):.1f} ms | "
+            f"lag-{corr_method}={float(metrics_row[f'{lead_name}_lag_corrected_{corr_method}']):.3f} | "
+            f"rpeak-mae={float(metrics_row[f'{lead_name}_lag_corrected_rpeak_timing_mae_ms']):.1f} ms"
         ),
         fontsize=11,
     )
@@ -786,8 +963,9 @@ def save_focus_lead_plot(
         left = max(0, int(center) - half_window_samples)
         right = min(target.shape[0], int(center) + half_window_samples)
         segment_time_ms = (time_s[left:right] - time_s[int(center)]) * 1000.0
-        ax.plot(segment_time_ms, target[left:right], color="black", linewidth=1.2, label="target (eval-domain)")
-        ax.plot(segment_time_ms, pred[left:right], color="red", linewidth=1.2, alpha=0.85, label="reconstructed")
+        ax.plot(segment_time_ms, target[left:right], color="black", linewidth=1.2, label=target_label)
+        ax.plot(segment_time_ms, pred[left:right], color="red", linewidth=1.2, alpha=0.85, label=pred_label)
+        ax.plot(segment_time_ms, pred_shifted[left:right], color="#1f77b4", linewidth=1.1, alpha=0.85, linestyle="--", label="lag-corrected recon")
         ax.axvline(0.0, color="gray", linestyle="--", linewidth=0.8, alpha=0.8)
         ax.set_ylabel("amp")
         ax.grid(alpha=0.25)
@@ -870,17 +1048,30 @@ def build_reconstruction_metrics_row(
     target_channels: list[str],
     reconstructed: np.ndarray,
     corr_method: str = "pearson",
+    lag_search_window_ms: float = 150.0,
+    dtw_max_points: int = 2000,
+    rpeak_tolerance_ms: float = 120.0,
 ) -> dict[str, object]:
     row: dict[str, object] = {
         "file_name": record.path.name,
         "original_sampling_rate_hz": record.original_sampling_rate_hz,
         "effective_sampling_rate_hz": record.sampling_rate_hz,
         "corr_method": corr_method,
+        "lag_search_window_ms": lag_search_window_ms,
+        "rpeak_tolerance_ms": rpeak_tolerance_ms,
     }
     lead_corr_values = []
     lead_mse_values = []
     lead_mae_values = []
     lead_rmse_values = []
+    lead_lag_corr_values = []
+    lead_lag_rmse_values = []
+    lead_lag_mae_values = []
+    lead_max_xcorr_values = []
+    lead_abs_lag_ms_values = []
+    lead_dtw_values = []
+    lead_rpeak_mae_values = []
+    lead_rpeak_match_values = []
     for lead_idx, lead_name in enumerate(target_channels):
         target = record.target_signals[lead_idx]
         pred = reconstructed[lead_idx]
@@ -892,14 +1083,58 @@ def build_reconstruction_metrics_row(
         row[f"{lead_name}_mae"] = mae
         row[f"{lead_name}_rmse"] = rmse
         row[f"{lead_name}_{corr_method}"] = corr
+        lag_metrics = _bounded_xcorr_metrics(
+            target=target,
+            pred=pred,
+            sampling_rate_hz=float(record.sampling_rate_hz),
+            corr_method=corr_method,
+            max_lag_ms=lag_search_window_ms,
+        )
+        lag_samples = int(round(lag_metrics["best_lag_samples"]))
+        target_aligned, pred_aligned = _overlap_with_lag(target=target, pred=pred, lag_samples=lag_samples)
+        dtw_target = _downsample_for_dtw(target_aligned, max_points=dtw_max_points)
+        dtw_pred = _downsample_for_dtw(pred_aligned, max_points=dtw_max_points)
+        band_radius = max(2, int(round(abs(lag_metrics["best_lag_ms"]) * float(record.sampling_rate_hz) / 1000.0)))
+        dtw_value = _banded_dtw_distance(dtw_target, dtw_pred, band_radius=band_radius)
+        rpeak_mae_ms, rpeak_match_fraction = _match_rpeak_mae_ms(
+            target=target_aligned,
+            pred=pred_aligned,
+            sampling_rate_hz=float(record.sampling_rate_hz),
+            tolerance_ms=rpeak_tolerance_ms,
+        )
+        row[f"{lead_name}_max_xcorr"] = lag_metrics["max_xcorr"]
+        row[f"{lead_name}_best_lag_samples"] = lag_metrics["best_lag_samples"]
+        row[f"{lead_name}_best_lag_ms"] = lag_metrics["best_lag_ms"]
+        row[f"{lead_name}_lag_corrected_{corr_method}"] = lag_metrics[f"lag_corrected_{corr_method}"]
+        row[f"{lead_name}_lag_corrected_rmse"] = lag_metrics["lag_corrected_rmse"]
+        row[f"{lead_name}_lag_corrected_mae"] = lag_metrics["lag_corrected_mae"]
+        row[f"{lead_name}_dtw_distance"] = dtw_value
+        row[f"{lead_name}_lag_corrected_rpeak_timing_mae_ms"] = rpeak_mae_ms
+        row[f"{lead_name}_lag_corrected_rpeak_match_fraction"] = rpeak_match_fraction
         lead_mse_values.append(mse)
         lead_mae_values.append(mae)
         lead_rmse_values.append(rmse)
         lead_corr_values.append(corr)
+        lead_lag_corr_values.append(lag_metrics[f"lag_corrected_{corr_method}"])
+        lead_lag_rmse_values.append(lag_metrics["lag_corrected_rmse"])
+        lead_lag_mae_values.append(lag_metrics["lag_corrected_mae"])
+        lead_max_xcorr_values.append(lag_metrics["max_xcorr"])
+        lead_abs_lag_ms_values.append(abs(lag_metrics["best_lag_ms"]))
+        lead_dtw_values.append(dtw_value)
+        lead_rpeak_mae_values.append(rpeak_mae_ms)
+        lead_rpeak_match_values.append(rpeak_match_fraction)
     row["mean_mse"] = float(np.mean(lead_mse_values))
     row["mean_mae"] = float(np.mean(lead_mae_values))
     row["mean_rmse"] = float(np.mean(lead_rmse_values))
     row[f"mean_{corr_method}"] = float(np.nanmean(lead_corr_values))
+    row["mean_max_xcorr"] = float(np.nanmean(lead_max_xcorr_values))
+    row["mean_abs_best_lag_ms"] = float(np.nanmean(lead_abs_lag_ms_values))
+    row[f"mean_lag_corrected_{corr_method}"] = float(np.nanmean(lead_lag_corr_values))
+    row["mean_lag_corrected_rmse"] = float(np.nanmean(lead_lag_rmse_values))
+    row["mean_lag_corrected_mae"] = float(np.nanmean(lead_lag_mae_values))
+    row["mean_dtw_distance"] = float(np.nanmean(lead_dtw_values))
+    row["mean_lag_corrected_rpeak_timing_mae_ms"] = float(np.nanmean(lead_rpeak_mae_values))
+    row["mean_lag_corrected_rpeak_match_fraction"] = float(np.nanmean(lead_rpeak_match_values))
     return row
 
 
@@ -940,6 +1175,7 @@ def main(argv: list[str] | None = None) -> int:
     focus_num_beats = int(reconstruct_cfg.get("focus_num_beats", 4))
     focus_window_ms = float(reconstruct_cfg.get("focus_window_ms", 900.0))
     focus_plot_dpi = int(reconstruct_cfg.get("focus_plot_dpi", max(plot_dpi, 180)))
+    visual_filter_mode = str(reconstruct_cfg.get("visual_filter_mode", "recon_only"))
     save_latent_plots = bool(reconstruct_cfg.get("save_latent_plots", True))
     latent_plot_dir_value = reconstruct_cfg.get("latent_plot_dir")
     latent_plot_dir = ensure_dir(latent_plot_dir_value) if latent_plot_dir_value else output_dir / "latent_plots"
@@ -948,6 +1184,9 @@ def main(argv: list[str] | None = None) -> int:
     latent_projection_method = str(reconstruct_cfg.get("latent_projection_method", "umap_like"))
     latent_projection_neighbors = int(reconstruct_cfg.get("latent_projection_neighbors", 12))
     latent_projection_seed = int(reconstruct_cfg.get("latent_projection_seed", config.get("seed", 42)))
+    lag_search_window_ms = float(reconstruct_cfg.get("lag_search_window_ms", 150.0))
+    dtw_max_points = int(reconstruct_cfg.get("dtw_max_points", 2000))
+    rpeak_tolerance_ms = float(reconstruct_cfg.get("rpeak_tolerance_ms", 120.0))
 
     target_channels = list(data_cfg.get("target_channels") or [f"CH{i}" for i in range(1, 9)])
     records = load_upperarm_records(
@@ -1010,6 +1249,9 @@ def main(argv: list[str] | None = None) -> int:
             target_channels=target_channels,
             reconstructed=y_hat_full,
             corr_method=corr_method,
+            lag_search_window_ms=lag_search_window_ms,
+            dtw_max_points=dtw_max_points,
+            rpeak_tolerance_ms=rpeak_tolerance_ms,
         )
         if save_plots:
             plot_path = plot_dir / f"{record.path.stem}_comparison.png"
@@ -1019,6 +1261,7 @@ def main(argv: list[str] | None = None) -> int:
                 target_channels=target_channels,
                 reconstructed=y_hat_full,
                 metrics_row=row,
+                visual_filter_mode=visual_filter_mode,
                 max_plot_samples=max_plot_samples,
                 dpi=plot_dpi,
             )
@@ -1032,6 +1275,7 @@ def main(argv: list[str] | None = None) -> int:
                 reconstructed=y_hat_full,
                 metrics_row=row,
                 focus_lead=focus_lead,
+                visual_filter_mode=visual_filter_mode,
                 num_beats=focus_num_beats,
                 window_ms=focus_window_ms,
                 max_plot_samples=max_plot_samples,
@@ -1073,6 +1317,8 @@ def main(argv: list[str] | None = None) -> int:
         "original_sampling_rate_hz",
         "effective_sampling_rate_hz",
         "corr_method",
+        "lag_search_window_ms",
+        "rpeak_tolerance_ms",
         "plot_path",
         "focus_lead",
         "focus_plot_path",
@@ -1081,6 +1327,14 @@ def main(argv: list[str] | None = None) -> int:
         "mean_mae",
         "mean_rmse",
         f"mean_{corr_method}",
+        "mean_max_xcorr",
+        "mean_abs_best_lag_ms",
+        f"mean_lag_corrected_{corr_method}",
+        "mean_lag_corrected_rmse",
+        "mean_lag_corrected_mae",
+        "mean_dtw_distance",
+        "mean_lag_corrected_rpeak_timing_mae_ms",
+        "mean_lag_corrected_rpeak_match_fraction",
     ]
     for lead_name in target_channels:
         fieldnames.extend(
@@ -1089,6 +1343,15 @@ def main(argv: list[str] | None = None) -> int:
                 f"{lead_name}_mae",
                 f"{lead_name}_rmse",
                 f"{lead_name}_{corr_method}",
+                f"{lead_name}_max_xcorr",
+                f"{lead_name}_best_lag_samples",
+                f"{lead_name}_best_lag_ms",
+                f"{lead_name}_lag_corrected_{corr_method}",
+                f"{lead_name}_lag_corrected_rmse",
+                f"{lead_name}_lag_corrected_mae",
+                f"{lead_name}_dtw_distance",
+                f"{lead_name}_lag_corrected_rpeak_timing_mae_ms",
+                f"{lead_name}_lag_corrected_rpeak_match_fraction",
             ]
         )
     _append_metrics(metrics_path, metrics_rows, fieldnames=fieldnames)
