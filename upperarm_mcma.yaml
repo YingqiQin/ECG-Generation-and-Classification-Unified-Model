@@ -2,6 +2,13 @@ data:
   dataset_type: upperarm_csv
   csv_dir: null
   file_glob: emg_data_*.csv
+  segment_group_regex: '^(?P<record>.+)_\d+s$'
+  segment_offset_regex: '_(?P<offset_seconds>\d+)s$'
+  npz_timestamp_key: timestamp_ms
+  npz_sampling_rate_key: sampling_rate_hz
+  npz_start_time_key: start_time_ms
+  npz_signal_matrix_key: null
+  npz_channel_names_key: null
   input_channel: CH20
   target_channels: [CH1, CH2, CH3, CH4, CH5, CH6, CH7, CH8]
   batch_size: 64
@@ -70,6 +77,7 @@ reconstruct:
   latent_projection_neighbors: 12
   latent_projection_seed: 42
   latent_plot_dpi: 180
+  enable_lag_metrics: true
   lag_search_window_ms: 150.0
   dtw_max_points: 2000
   rpeak_tolerance_ms: 120.0
@@ -77,7 +85,9 @@ reconstruct:
   max_files: null
 
 crossval:
+  protocol: kfold
   num_folds: 5
+  holdout_test_ratio: 0.2
   seed: 42
   inner_val_ratio: 0.2
   fine_tune_epochs: null

@@ -6,6 +6,7 @@ import itertools
 from pathlib import Path
 from typing import Any
 
+from mcma_torch.data.upperarm_csv import discover_upperarm_source_units, is_upperarm_dataset_type
 from mcma_torch.eval.cv_upperarm import (
     _apply_overrides,
     _build_fieldnames,
@@ -83,6 +84,23 @@ def _resolve_checkpoint(train_dir: Path) -> Path:
     raise FileNotFoundError(f"No checkpoint found in {train_dir}")
 
 
+def _summary_metric_names(corr_method: str) -> list[str]:
+    return [
+        "mean_mse",
+        "mean_mae",
+        "mean_rmse",
+        f"mean_{corr_method}",
+        "mean_max_xcorr",
+        "mean_abs_best_lag_ms",
+        f"mean_lag_corrected_{corr_method}",
+        "mean_lag_corrected_rmse",
+        "mean_lag_corrected_mae",
+        "mean_dtw_distance",
+        "mean_lag_corrected_rpeak_timing_mae_ms",
+        "mean_lag_corrected_rpeak_match_fraction",
+    ]
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config_path = Path(args.config)
@@ -96,6 +114,9 @@ def main(argv: list[str] | None = None) -> int:
 
     data_cfg = config.get("data", {})
     crossval_cfg = config.get("crossval", {})
+    dataset_type = str(data_cfg.get("dataset_type", "upperarm_csv"))
+    if not is_upperarm_dataset_type(dataset_type):
+        raise ValueError(f"subject_protocol_upperarm requires an upper-arm dataset type, got {dataset_type}")
     subject_cfg = config.get("subject_protocol", {})
 
     subject_root_dir = Path(subject_cfg.get("subject_root_dir", data_cfg.get("csv_dir", ".")))
@@ -113,7 +134,17 @@ def main(argv: list[str] | None = None) -> int:
         subject_dir_glob=subject_dir_glob,
         file_glob=file_glob,
     )
-    subject_files = {subject_dir.name: sorted(subject_dir.glob(file_glob)) for subject_dir in subject_dirs}
+    subject_files = {
+        subject_dir.name: discover_upperarm_source_units(
+            csv_dir=subject_dir,
+            file_glob=file_glob,
+            dataset_type=dataset_type,
+            max_files=data_cfg.get("max_files"),
+            segment_group_regex=data_cfg.get("segment_group_regex", r"^(?P<record>.+)_\d+s$"),
+            segment_offset_regex=data_cfg.get("segment_offset_regex", r"_(?P<offset_seconds>\d+)s$"),
+        )
+        for subject_dir in subject_dirs
+    }
     for subject_name, files in subject_files.items():
         if len(files) < min_files_per_subject:
             raise RuntimeError(
@@ -151,7 +182,7 @@ def main(argv: list[str] | None = None) -> int:
 
         if per_subject_summary_rows:
             summary_fields = ["subject", "subject_dir", "num_subject_files", "stage", "num_files"]
-            for metric in ["mean_mse", "mean_mae", "mean_rmse", f"mean_{corr_method}"]:
+            for metric in _summary_metric_names(corr_method):
                 summary_fields.extend([f"{metric}_mean", f"{metric}_std"])
             _write_csv(output_dir / "per_subject_summary.csv", per_subject_summary_rows, fieldnames=summary_fields)
 
@@ -242,8 +273,8 @@ def main(argv: list[str] | None = None) -> int:
                 [
                     f"data.csv_dir={source_dir}",
                     f"out_dir={train_output_dir}",
-                    f"data.split_files.train={','.join(path.name for path in train_files)}",
-                    f"data.split_files.val={','.join(path.name for path in val_files)}",
+                    f"data.split_files.train={','.join(path.path.name for path in train_files)}",
+                    f"data.split_files.val={','.join(path.path.name for path in val_files)}",
                     "data.train_ratio=1.0",
                     "data.val_ratio=0.0",
                     "data.test_ratio=0.0",
@@ -296,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
                 test_num_files=len(subject_files[target_dir.name]),
             )
             pair_summary_fields = ["source_subject", "target_subject", "train_num_files", "test_num_files", "stage", "num_files"]
-            for metric in ["mean_mse", "mean_mae", "mean_rmse", f"mean_{corr_method}"]:
+            for metric in _summary_metric_names(corr_method):
                 pair_summary_fields.extend([f"{metric}_mean", f"{metric}_std"])
             _write_csv(pair_output_dir / "summary.csv", pair_summaries, fieldnames=pair_summary_fields)
             _write_csv(pair_output_dir / "file_metrics.csv", pair_rows, fieldnames=fieldnames)
@@ -308,7 +339,7 @@ def main(argv: list[str] | None = None) -> int:
             _write_csv(output_dir / "cross_subject_file_metrics.csv", cross_subject_rows, fieldnames=fieldnames)
         if cross_subject_summary_rows:
             pair_summary_fields = ["source_subject", "target_subject", "train_num_files", "test_num_files", "stage", "num_files"]
-            for metric in ["mean_mse", "mean_mae", "mean_rmse", f"mean_{corr_method}"]:
+            for metric in _summary_metric_names(corr_method):
                 pair_summary_fields.extend([f"{metric}_mean", f"{metric}_std"])
             _write_csv(output_dir / "cross_subject_summary.csv", cross_subject_summary_rows, fieldnames=pair_summary_fields)
 
