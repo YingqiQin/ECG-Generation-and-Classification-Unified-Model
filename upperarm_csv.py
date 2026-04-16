@@ -54,6 +54,14 @@ def _normalize_name_list(value: Iterable[str] | str | None) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
+def _as_path_list(value: Iterable[str | Path] | str | Path | None) -> list[Path]:
+    if value is None:
+        return []
+    if isinstance(value, (str, Path)):
+        return [Path(value)]
+    return [Path(item) for item in value]
+
+
 def _discover_files(csv_dir: str | Path, file_glob: str, max_files: int | None = None) -> list[Path]:
     files = sorted(Path(csv_dir).glob(file_glob))
     if max_files is not None:
@@ -119,6 +127,31 @@ def discover_upperarm_source_units(
     raise ValueError(f"Unsupported dataset_type: {dataset_type}")
 
 
+def discover_upperarm_source_units_from_dirs(
+    csv_dirs: Iterable[str | Path] | str | Path,
+    file_glob: str,
+    dataset_type: str = "upperarm_csv",
+    max_files: int | None = None,
+    segment_group_regex: str = DEFAULT_SEGMENT_GROUP_REGEX,
+    segment_offset_regex: str = DEFAULT_SEGMENT_OFFSET_REGEX,
+) -> list[UpperArmSourceUnit]:
+    units: list[UpperArmSourceUnit] = []
+    for root in _as_path_list(csv_dirs):
+        root_units = discover_upperarm_source_units(
+            csv_dir=root,
+            file_glob=file_glob,
+            dataset_type=dataset_type,
+            max_files=None,
+            segment_group_regex=segment_group_regex,
+            segment_offset_regex=segment_offset_regex,
+        )
+        units.extend(root_units)
+    units = sorted(units, key=lambda unit: str(unit.path))
+    if max_files is not None:
+        units = units[:max_files]
+    return units
+
+
 def _split_units(
     units: list[UpperArmSourceUnit],
     split: str | None,
@@ -134,8 +167,18 @@ def _split_units(
         requested = set(_normalize_name_list(split_files.get(split)))
         if not requested:
             raise RuntimeError(f"No files specified for split {split}")
-        selected = [unit for unit in units if unit.path.name in requested]
-        missing = sorted(requested - {unit.path.name for unit in selected})
+        unit_keys = {
+            unit: {
+                unit.path.name,
+                str(unit.path),
+                *[source.name for source in unit.source_paths],
+                *[str(source) for source in unit.source_paths],
+            }
+            for unit in units
+        }
+        selected = [unit for unit, keys in unit_keys.items() if keys & requested]
+        matched = {key for keys in unit_keys.values() for key in keys & requested}
+        missing = sorted(requested - matched)
         if missing:
             raise RuntimeError(f"Requested files for split {split} not found: {missing}")
         return sorted(selected, key=lambda unit: unit.path.name)
@@ -601,9 +644,11 @@ def load_upperarm_records(
     npz_start_time_key: str | None = "start_time_ms",
     npz_signal_matrix_key: str | None = None,
     npz_channel_names_key: str | None = None,
+    csv_dirs: Iterable[str | Path] | str | Path | None = None,
 ) -> list[PreparedUpperArmRecord]:
-    units = discover_upperarm_source_units(
-        csv_dir=csv_dir,
+    roots = csv_dirs or csv_dir
+    units = discover_upperarm_source_units_from_dirs(
+        csv_dirs=roots,
         file_glob=file_glob,
         dataset_type=dataset_type,
         max_files=max_files,
@@ -674,6 +719,7 @@ class UpperArmCSVWindowsDataset(Dataset):
         npz_start_time_key: str | None = "start_time_ms",
         npz_signal_matrix_key: str | None = None,
         npz_channel_names_key: str | None = None,
+        csv_dirs: Iterable[str | Path] | str | Path | None = None,
     ) -> None:
         self.segment_length = int(segment_length)
         self.segment_stride = int(segment_stride)
@@ -705,6 +751,7 @@ class UpperArmCSVWindowsDataset(Dataset):
             npz_start_time_key=npz_start_time_key,
             npz_signal_matrix_key=npz_signal_matrix_key,
             npz_channel_names_key=npz_channel_names_key,
+            csv_dirs=csv_dirs,
         )
 
         self.items: list[tuple[int, int]] = []

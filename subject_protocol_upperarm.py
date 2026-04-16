@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import fnmatch
 import itertools
 from pathlib import Path
 from typing import Any
@@ -101,6 +102,13 @@ def _summary_metric_names(corr_method: str) -> list[str]:
     ]
 
 
+def _matches_any_glob(name: str, patterns: str) -> bool:
+    candidates = [item.strip() for item in str(patterns).split(",") if item.strip()]
+    if not candidates:
+        return True
+    return any(fnmatch.fnmatch(name, pattern) for pattern in candidates)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config_path = Path(args.config)
@@ -125,9 +133,40 @@ def main(argv: list[str] | None = None) -> int:
     output_dir = ensure_dir(subject_cfg.get("output_dir", "artifacts/upperarm_subject_protocol"))
     run_per_subject_cv = bool(subject_cfg.get("run_per_subject_cv", True))
     run_cross_subject = bool(subject_cfg.get("run_cross_subject", True))
+    run_leave_one_subject_out = bool(subject_cfg.get("run_leave_one_subject_out", False))
     min_files_per_subject = int(subject_cfg.get("min_files_per_subject", 2))
     corr_method = str(crossval_cfg.get("corr_method", config.get("reconstruct", {}).get("corr_method", "pearson")))
     target_channels = list(data_cfg.get("target_channels") or [f"CH{i}" for i in range(1, 9)])
+
+    latent_projection_method = str(
+        crossval_cfg.get(
+            "latent_projection_method",
+            config.get("reconstruct", {}).get("latent_projection_method", "umap"),
+        )
+    )
+    latent_projection_neighbors = int(
+        crossval_cfg.get(
+            "latent_projection_neighbors",
+            config.get("reconstruct", {}).get("latent_projection_neighbors", 12),
+        )
+    )
+    latent_projection_seed = int(
+        crossval_cfg.get(
+            "latent_projection_seed",
+            config.get("reconstruct", {}).get("latent_projection_seed", config.get("seed", 42)),
+        )
+    )
+    save_plots = bool(crossval_cfg.get("save_plots", True))
+    max_plot_samples = int(crossval_cfg.get("max_plot_samples", config.get("reconstruct", {}).get("max_plot_samples", 4000)))
+    plot_dpi = int(crossval_cfg.get("plot_dpi", config.get("reconstruct", {}).get("plot_dpi", 150)))
+    save_focus_plots = bool(crossval_cfg.get("save_focus_plots", config.get("reconstruct", {}).get("save_focus_plots", True)))
+    focus_lead = crossval_cfg.get("focus_lead", config.get("reconstruct", {}).get("focus_lead"))
+    focus_num_beats = int(crossval_cfg.get("focus_num_beats", config.get("reconstruct", {}).get("focus_num_beats", 4)))
+    focus_window_ms = float(crossval_cfg.get("focus_window_ms", config.get("reconstruct", {}).get("focus_window_ms", 900.0)))
+    focus_plot_dpi = int(crossval_cfg.get("focus_plot_dpi", config.get("reconstruct", {}).get("focus_plot_dpi", max(plot_dpi, 180))))
+    save_latent_plots = bool(crossval_cfg.get("save_latent_plots", config.get("reconstruct", {}).get("save_latent_plots", True)))
+    latent_max_windows_per_signal = int(crossval_cfg.get("latent_max_windows_per_signal", config.get("reconstruct", {}).get("latent_max_windows_per_signal", 24)))
+    latent_plot_dpi = int(crossval_cfg.get("latent_plot_dpi", config.get("reconstruct", {}).get("latent_plot_dpi", max(plot_dpi, 180))))
 
     subject_dirs = _discover_subject_dirs(
         root_dir=subject_root_dir,
@@ -342,6 +381,181 @@ def main(argv: list[str] | None = None) -> int:
             for metric in _summary_metric_names(corr_method):
                 pair_summary_fields.extend([f"{metric}_mean", f"{metric}_std"])
             _write_csv(output_dir / "cross_subject_summary.csv", cross_subject_summary_rows, fieldnames=pair_summary_fields)
+
+    loso_rows: list[dict[str, object]] = []
+    loso_summary_rows: list[dict[str, object]] = []
+    if run_leave_one_subject_out:
+        train_subject_glob = str(subject_cfg.get("leave_one_subject_train_subject_glob", "*"))
+        test_subject_glob = str(subject_cfg.get("leave_one_subject_test_subject_glob", "*"))
+        candidate_train_dirs = [
+            subject_dir for subject_dir in subject_dirs if _matches_any_glob(subject_dir.name, train_subject_glob)
+        ]
+        candidate_test_dirs = [
+            subject_dir for subject_dir in subject_dirs if _matches_any_glob(subject_dir.name, test_subject_glob)
+        ]
+        if not candidate_test_dirs:
+            raise RuntimeError(f"No held-out subjects matched leave_one_subject_test_subject_glob={test_subject_glob}")
+
+        loso_val_ratio = float(subject_cfg.get("leave_one_subject_val_ratio", crossval_cfg.get("inner_val_ratio", 0.2)))
+        loso_epochs = subject_cfg.get("leave_one_subject_fine_tune_epochs", crossval_cfg.get("fine_tune_epochs"))
+        loso_root = ensure_dir(output_dir / "leave_one_subject_out")
+        loso_fieldnames = [
+            "heldout_subject",
+            "train_subjects",
+            "train_num_subjects",
+            "train_num_files",
+            "test_num_files",
+            *[field for field in _build_fieldnames(target_channels=target_channels, corr_method=corr_method) if field != "fold"],
+        ]
+
+        for target_dir in candidate_test_dirs:
+            source_dirs = [subject_dir for subject_dir in candidate_train_dirs if subject_dir != target_dir]
+            if not source_dirs:
+                raise RuntimeError(f"No source subjects available after leaving out {target_dir.name}")
+
+            pooled_source_files = [
+                unit
+                for source_dir in source_dirs
+                for unit in subject_files[source_dir.name]
+            ]
+            train_files, val_files = _split_train_and_val(
+                pooled_source_files,
+                val_ratio=loso_val_ratio,
+                seed=int(config.get("seed", 42)),
+            )
+            train_subjects_label = ",".join(subject_dir.name for subject_dir in source_dirs)
+            loso_output_dir = ensure_dir(loso_root / f"leave_out_{target_dir.name}")
+            target_rows: list[dict[str, object]] = []
+
+            if args.pretrained_ckpt:
+                zero_shot_rows = _evaluate_checkpoint_on_files(
+                    config=config,
+                    ckpt_path=Path(args.pretrained_ckpt),
+                    files=subject_files[target_dir.name],
+                    corr_method=corr_method,
+                    plot_dir=(loso_output_dir / "zero_shot") if save_plots else None,
+                    max_plot_samples=max_plot_samples,
+                    plot_dpi=plot_dpi,
+                    focus_plot_dir=(loso_output_dir / "zero_shot_focus") if save_focus_plots else None,
+                    focus_lead=focus_lead,
+                    focus_num_beats=focus_num_beats,
+                    focus_window_ms=focus_window_ms,
+                    focus_plot_dpi=focus_plot_dpi,
+                    latent_plot_dir=(loso_output_dir / "zero_shot_latent") if save_latent_plots else None,
+                    latent_max_windows_per_signal=latent_max_windows_per_signal,
+                    latent_plot_dpi=latent_plot_dpi,
+                    latent_projection_method=latent_projection_method,
+                    latent_projection_neighbors=latent_projection_neighbors,
+                    latent_projection_seed=latent_projection_seed,
+                )
+                target_rows.extend(
+                    _tag_rows(
+                        zero_shot_rows,
+                        heldout_subject=target_dir.name,
+                        train_subjects=train_subjects_label,
+                        train_num_subjects=len(source_dirs),
+                        train_num_files=len(pooled_source_files),
+                        test_num_files=len(subject_files[target_dir.name]),
+                        stage="zero_shot",
+                    )
+                )
+
+            train_output_dir = loso_output_dir / "train"
+            fit_overrides = list(args.overrides)
+            fit_overrides.extend(
+                [
+                    f"data.csv_dirs={','.join(str(subject_dir) for subject_dir in source_dirs)}",
+                    f"out_dir={train_output_dir}",
+                    f"data.split_files.train={','.join(str(unit.path) for unit in train_files)}",
+                    f"data.split_files.val={','.join(str(unit.path) for unit in val_files)}",
+                    "data.train_ratio=1.0",
+                    "data.val_ratio=0.0",
+                    "data.test_ratio=0.0",
+                ]
+            )
+            if loso_epochs is not None:
+                fit_overrides.append(f"trainer.epochs={loso_epochs}")
+            if args.pretrained_ckpt:
+                fit_overrides.append(f"trainer.init_ckpt={args.pretrained_ckpt}")
+
+            fit_status = fit_main(["--config", str(config_path), *fit_overrides])
+            if fit_status != 0:
+                raise RuntimeError(f"LOSO fine-tuning failed for held-out subject {target_dir.name} with status {fit_status}")
+
+            fine_tuned_ckpt = _resolve_checkpoint(train_output_dir)
+            fine_tuned_rows = _evaluate_checkpoint_on_files(
+                config=config,
+                ckpt_path=fine_tuned_ckpt,
+                files=subject_files[target_dir.name],
+                corr_method=corr_method,
+                plot_dir=(loso_output_dir / "fine_tuned") if save_plots else None,
+                max_plot_samples=max_plot_samples,
+                plot_dpi=plot_dpi,
+                focus_plot_dir=(loso_output_dir / "fine_tuned_focus") if save_focus_plots else None,
+                focus_lead=focus_lead,
+                focus_num_beats=focus_num_beats,
+                focus_window_ms=focus_window_ms,
+                focus_plot_dpi=focus_plot_dpi,
+                latent_plot_dir=(loso_output_dir / "fine_tuned_latent") if save_latent_plots else None,
+                latent_max_windows_per_signal=latent_max_windows_per_signal,
+                latent_plot_dpi=latent_plot_dpi,
+                latent_projection_method=latent_projection_method,
+                latent_projection_neighbors=latent_projection_neighbors,
+                latent_projection_seed=latent_projection_seed,
+            )
+            target_rows.extend(
+                _tag_rows(
+                    fine_tuned_rows,
+                    heldout_subject=target_dir.name,
+                    train_subjects=train_subjects_label,
+                    train_num_subjects=len(source_dirs),
+                    train_num_files=len(pooled_source_files),
+                    test_num_files=len(subject_files[target_dir.name]),
+                    stage="fine_tuned",
+                )
+            )
+
+            target_summaries = _tag_rows(
+                _summarize_rows(target_rows, corr_method=corr_method),
+                heldout_subject=target_dir.name,
+                train_subjects=train_subjects_label,
+                train_num_subjects=len(source_dirs),
+                train_num_files=len(pooled_source_files),
+                test_num_files=len(subject_files[target_dir.name]),
+            )
+            loso_summary_fields = [
+                "heldout_subject",
+                "train_subjects",
+                "train_num_subjects",
+                "train_num_files",
+                "test_num_files",
+                "stage",
+                "num_files",
+            ]
+            for metric in _summary_metric_names(corr_method):
+                loso_summary_fields.extend([f"{metric}_mean", f"{metric}_std"])
+
+            _write_csv(loso_output_dir / "file_metrics.csv", target_rows, fieldnames=loso_fieldnames)
+            _write_csv(loso_output_dir / "summary.csv", target_summaries, fieldnames=loso_summary_fields)
+            loso_rows.extend(target_rows)
+            loso_summary_rows.extend(target_summaries)
+            print(f"Completed leave-one-subject-out for held-out subject {target_dir.name} -> {loso_output_dir}")
+
+        if loso_rows:
+            _write_csv(output_dir / "leave_one_subject_out_file_metrics.csv", loso_rows, fieldnames=loso_fieldnames)
+        if loso_summary_rows:
+            loso_summary_fields = [
+                "heldout_subject",
+                "train_subjects",
+                "train_num_subjects",
+                "train_num_files",
+                "test_num_files",
+                "stage",
+                "num_files",
+            ]
+            for metric in _summary_metric_names(corr_method):
+                loso_summary_fields.extend([f"{metric}_mean", f"{metric}_std"])
+            _write_csv(output_dir / "leave_one_subject_out_summary.csv", loso_summary_rows, fieldnames=loso_summary_fields)
 
     return 0
 

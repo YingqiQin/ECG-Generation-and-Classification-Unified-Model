@@ -787,10 +787,14 @@ def _select_focus_centers(
         indices = np.unique(np.round(positions).astype(np.int64))
         return valid[indices]
 
+    if signal.shape[0] <= 2 * half_window_samples:
+        return np.array([max(0, signal.shape[0] // 2)], dtype=np.int64)
+
     available_start = half_window_samples
     available_stop = max(available_start + 1, signal.shape[0] - half_window_samples)
     positions = np.linspace(available_start, available_stop - 1, num=num_beats)
-    return np.unique(np.round(positions).astype(np.int64))
+    centers = np.unique(np.round(positions).astype(np.int64))
+    return np.clip(centers, 0, max(0, signal.shape[0] - 1))
 
 
 def save_reconstruction_comparison_plot(
@@ -1250,6 +1254,7 @@ def main(argv: list[str] | None = None) -> int:
         npz_start_time_key=data_cfg.get("npz_start_time_key", "start_time_ms"),
         npz_signal_matrix_key=data_cfg.get("npz_signal_matrix_key"),
         npz_channel_names_key=data_cfg.get("npz_channel_names_key"),
+        csv_dirs=data_cfg.get("csv_dirs"),
     )
 
     model = build_upperarm_model(model_cfg=model_cfg, target_channels=target_channels, device=device)

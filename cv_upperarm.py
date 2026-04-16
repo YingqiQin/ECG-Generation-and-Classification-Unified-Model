@@ -12,7 +12,7 @@ import torch
 
 from mcma_torch.data.upperarm_csv import (
     UpperArmSourceUnit,
-    discover_upperarm_source_units,
+    discover_upperarm_source_units_from_dirs,
     is_upperarm_dataset_type,
     prepare_upperarm_record_from_unit,
 )
@@ -88,8 +88,9 @@ def _discover_units(data_cfg: dict) -> list[UpperArmSourceUnit]:
     dataset_type = str(data_cfg.get("dataset_type", "upperarm_csv"))
     if not is_upperarm_dataset_type(dataset_type):
         raise ValueError(f"cv_upperarm requires an upper-arm dataset type, got {dataset_type}")
-    units = discover_upperarm_source_units(
-        csv_dir=data_cfg["csv_dir"],
+    roots = data_cfg.get("csv_dirs") or data_cfg["csv_dir"]
+    units = discover_upperarm_source_units_from_dirs(
+        csv_dirs=roots,
         file_glob=data_cfg.get("file_glob", "emg_data_*.csv"),
         dataset_type=dataset_type,
         max_files=data_cfg.get("max_files"),

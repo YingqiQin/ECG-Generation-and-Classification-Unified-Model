@@ -1,6 +1,7 @@
 data:
   dataset_type: upperarm_csv
   csv_dir: null
+  csv_dirs: null
   file_glob: emg_data_*.csv
   segment_group_regex: '^(?P<record>.+)_\d+s$'
   segment_offset_regex: '_(?P<offset_seconds>\d+)s$'
@@ -114,6 +115,11 @@ subject_protocol:
   output_dir: artifacts/upperarm_subject_protocol
   run_per_subject_cv: true
   run_cross_subject: true
+  run_leave_one_subject_out: false
   min_files_per_subject: 2
   cross_subject_val_ratio: 0.2
   cross_subject_fine_tune_epochs: null
+  leave_one_subject_val_ratio: 0.2
+  leave_one_subject_fine_tune_epochs: null
+  leave_one_subject_train_subject_glob: "*"
+  leave_one_subject_test_subject_glob: "*"

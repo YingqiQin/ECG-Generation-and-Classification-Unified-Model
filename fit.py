@@ -145,6 +145,7 @@ def _build_dataset(split: str, data_cfg: dict) -> torch.utils.data.Dataset:
             npz_start_time_key=data_cfg.get("npz_start_time_key", "start_time_ms"),
             npz_signal_matrix_key=data_cfg.get("npz_signal_matrix_key"),
             npz_channel_names_key=data_cfg.get("npz_channel_names_key"),
+            csv_dirs=data_cfg.get("csv_dirs"),
         )
 
     random_input = bool(data_cfg.get("random_input_lead", True))
