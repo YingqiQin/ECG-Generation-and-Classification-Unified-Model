@@ -15,7 +15,7 @@ from mcma_torch.data.upperarm_csv import UpperArmCSVWindowsDataset, is_upperarm_
 from mcma_torch.models.mcma import MCMA
 from mcma_torch.utils import dist as dist_utils
 from mcma_torch.utils.config import load_config
-from mcma_torch.utils.checkpoint import load_shape_matched_checkpoint
+from mcma_torch.utils.checkpoint import build_upperarm_inference_bundle, load_shape_matched_checkpoint
 from mcma_torch.utils.io import append_csv, append_jsonl, ensure_dir
 from mcma_torch.utils.meter import AverageMeter
 from mcma_torch.utils.metrics import RunningMSE, RunningPCC
@@ -242,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
     set_seed(seed, deterministic=bool(trainer_cfg.get("deterministic", False)))
 
     out_dir = ensure_dir(config.get("out_dir", "artifacts/exp_mcma"))
+    deploy_dir = ensure_dir(out_dir / "deployment")
     metrics_path = out_dir / "metrics.jsonl"
     per_lead_path = out_dir / "per_lead_metrics.csv"
 
@@ -450,6 +451,15 @@ def main(argv: list[str] | None = None) -> int:
                 "val_pcc": val_pcc_mean,
             }
             torch.save(state, out_dir / "last.pt")
+            last_bundle = build_upperarm_inference_bundle(
+                model=_unwrap_model(model),
+                config=config,
+                epoch=epoch,
+                val_loss=val_loss,
+                val_pcc=val_pcc_mean,
+                source_checkpoint_name="last.pt",
+            )
+            torch.save(last_bundle, deploy_dir / "last_inference_bundle.pt")
 
             is_better = False
             if math.isfinite(val_loss):
@@ -467,6 +477,15 @@ def main(argv: list[str] | None = None) -> int:
                     best_pcc = val_pcc_mean
                 best_saved = True
                 torch.save(state, out_dir / "best.pt")
+                best_bundle = build_upperarm_inference_bundle(
+                    model=_unwrap_model(model),
+                    config=config,
+                    epoch=epoch,
+                    val_loss=val_loss,
+                    val_pcc=val_pcc_mean,
+                    source_checkpoint_name="best.pt",
+                )
+                torch.save(best_bundle, deploy_dir / "best_inference_bundle.pt")
 
         if args.dry_run:
             break
@@ -474,6 +493,7 @@ def main(argv: list[str] | None = None) -> int:
     if dist_utils.is_main_process():
         print("Training complete.")
         print(f"Artifacts saved to: {out_dir}")
+        print(f"Portable inference bundles saved to: {deploy_dir}")
 
     if ddp_enabled:
         dist_utils.cleanup_distributed()

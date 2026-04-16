@@ -22,15 +22,24 @@ from mcma_torch.data.upperarm_csv import (
     load_upperarm_records,
 )
 from mcma_torch.models.mcma import MCMA
-from mcma_torch.utils.checkpoint import load_shape_matched_checkpoint
+from mcma_torch.utils.checkpoint import (
+    extract_embedded_config,
+    load_checkpoint_payload,
+    load_shape_matched_checkpoint,
+)
 from mcma_torch.utils.config import load_config
 from mcma_torch.utils.io import ensure_dir
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Reconstruct target leads from upper-arm ECG CSV files.")
-    parser.add_argument("--config", required=True, help="Path to YAML config file.")
-    parser.add_argument("--ckpt", required=True, help="Path to a checkpoint produced by mcma_torch.train.fit.")
+    parser.add_argument("--config", default=None, help="Optional YAML config file.")
+    parser.add_argument("--ckpt", default=None, help="Path to a checkpoint produced by mcma_torch.train.fit.")
+    parser.add_argument(
+        "--bundle",
+        default=None,
+        help="Path to a portable inference bundle exported by mcma_torch.train.fit.",
+    )
     parser.add_argument(
         "overrides",
         nargs="*",
@@ -73,6 +82,16 @@ def _apply_overrides(config: dict, overrides: list[str]) -> dict:
         key, raw_value = item.split("=", 1)
         _set_nested(config, key.split("."), _parse_value(raw_value))
     return config
+
+
+def _merge_dicts(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def _pad_1d(signal: np.ndarray, target_len: int, pad_mode: str) -> np.ndarray:
@@ -1179,16 +1198,29 @@ def build_reconstruction_metrics_row(
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    config_path = Path(args.config)
-    ckpt_path = Path(args.ckpt)
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config not found: {config_path}")
+    if not args.ckpt and not args.bundle:
+        raise ValueError("Either --ckpt or --bundle is required")
+
+    config: dict[str, Any] = {}
+    if args.config:
+        config_path = Path(args.config)
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config not found: {config_path}")
+        config = load_config(config_path)
+        if not isinstance(config, dict):
+            raise ValueError("Config must parse into a dict")
+
+    ckpt_arg = args.bundle or args.ckpt
+    ckpt_path = Path(ckpt_arg)
     if not ckpt_path.exists():
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    config = load_config(config_path)
-    if not isinstance(config, dict):
-        raise ValueError("Config must parse into a dict")
+    payload = load_checkpoint_payload(ckpt_path=ckpt_path, device="cpu")
+    embedded_config = extract_embedded_config(payload)
+    if embedded_config is not None:
+        config = _merge_dicts(embedded_config, config)
+    if not config:
+        raise ValueError("No config available. Provide --config or use a checkpoint/bundle with embedded config.")
     config = _apply_overrides(config, args.overrides)
 
     data_cfg = config.get("data", {})
