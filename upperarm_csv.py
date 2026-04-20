@@ -498,13 +498,21 @@ def _prepare_record_from_raw_signals(
     normalize_mode: str,
     fallback_fs: float,
     target_fs: float | None,
+    original_sampling_rate_hz_override: float | None = None,
+    sampling_rate_hz_override: float | None = None,
 ) -> PreparedUpperArmRecord:
     timestamps_ms = np.asarray(timestamps_ms, dtype=np.float64).reshape(-1)
     if timestamps_ms.size == 0:
         raise ValueError(f"{path.name} has no timestamp samples")
 
-    original_sampling_rate_hz = _estimate_sampling_rate_hz(timestamps_ms, fallback_fs=fallback_fs)
-    if target_fs is not None and target_fs > 0:
+    original_sampling_rate_hz = (
+        float(original_sampling_rate_hz_override)
+        if original_sampling_rate_hz_override is not None
+        else _estimate_sampling_rate_hz(timestamps_ms, fallback_fs=fallback_fs)
+    )
+    if sampling_rate_hz_override is not None:
+        sampling_rate_hz = float(sampling_rate_hz_override)
+    elif target_fs is not None and target_fs > 0:
         timestamps_ms, raw_signals = _resample_record(
             timestamps_ms=timestamps_ms,
             signal_map=raw_signals,
@@ -620,10 +628,7 @@ def prepare_upperarm_record_from_unit(
     if effective_dataset_type != "upperarm_segmented_npz":
         raise ValueError(f"Unsupported dataset_type: {effective_dataset_type}")
 
-    timestamp_parts: list[np.ndarray] = []
-    signal_parts: dict[str, list[np.ndarray]] = {
-        channel: [] for channel in [input_channel, *target_channels_list]
-    }
+    loaded_segments: list[tuple[np.ndarray, dict[str, np.ndarray]]] = []
     for source_path in unit.source_paths:
         timestamps_ms, signal_map = _load_npz_segment(
             path=source_path,
@@ -637,9 +642,51 @@ def prepare_upperarm_record_from_unit(
             signal_matrix_key=npz_signal_matrix_key,
             channel_names_key=npz_channel_names_key,
         )
-        timestamp_parts.append(timestamps_ms)
-        for channel in signal_parts:
-            signal_parts[channel].append(signal_map[channel])
+        loaded_segments.append((timestamps_ms, signal_map))
+
+    original_timestamp_parts = [timestamps_ms for timestamps_ms, _ in loaded_segments]
+    original_signal_parts: dict[str, list[np.ndarray]] = {
+        channel: [] for channel in [input_channel, *target_channels_list]
+    }
+    for timestamps_ms, signal_map in loaded_segments:
+        for channel in original_signal_parts:
+            original_signal_parts[channel].append(signal_map[channel])
+
+    original_timestamps_ms = np.concatenate(original_timestamp_parts, axis=0)
+    original_raw_signals = {
+        channel: np.concatenate(parts, axis=0).astype(np.float32, copy=False)
+        for channel, parts in original_signal_parts.items()
+    }
+    original_order = np.argsort(original_timestamps_ms, kind="mergesort")
+    original_timestamps_ms = original_timestamps_ms[original_order]
+    original_raw_signals = {channel: values[original_order] for channel, values in original_raw_signals.items()}
+    original_dedup_mask = np.ones(original_timestamps_ms.shape[0], dtype=bool)
+    if original_timestamps_ms.size > 1:
+        original_dedup_mask[1:] = np.diff(original_timestamps_ms) > 0
+    original_timestamps_ms = original_timestamps_ms[original_dedup_mask]
+    original_raw_signals = {channel: values[original_dedup_mask] for channel, values in original_raw_signals.items()}
+    original_sampling_rate_hz = _estimate_sampling_rate_hz(original_timestamps_ms, fallback_fs=fallback_fs)
+
+    timestamp_parts: list[np.ndarray] = []
+    signal_parts: dict[str, list[np.ndarray]] = {
+        channel: [] for channel in [input_channel, *target_channels_list]
+    }
+    if target_fs is not None and target_fs > 0:
+        # Resample each kept segment independently so rejected intervals remain real gaps.
+        for timestamps_ms, signal_map in loaded_segments:
+            segment_timestamps_ms, segment_signal_map = _resample_record(
+                timestamps_ms=timestamps_ms,
+                signal_map=signal_map,
+                target_fs=float(target_fs),
+            )
+            timestamp_parts.append(segment_timestamps_ms)
+            for channel in signal_parts:
+                signal_parts[channel].append(segment_signal_map[channel])
+    else:
+        for timestamps_ms, signal_map in loaded_segments:
+            timestamp_parts.append(timestamps_ms)
+            for channel in signal_parts:
+                signal_parts[channel].append(signal_map[channel])
 
     timestamps_ms = np.concatenate(timestamp_parts, axis=0)
     raw_signals = {
@@ -656,6 +703,9 @@ def prepare_upperarm_record_from_unit(
     timestamps_ms = timestamps_ms[dedup_mask]
     raw_signals = {channel: values[dedup_mask] for channel, values in raw_signals.items()}
 
+    effective_target_fs = None if (target_fs is not None and target_fs > 0) else target_fs
+    effective_sampling_rate_hz = float(target_fs) if (target_fs is not None and target_fs > 0) else None
+
     return _prepare_record_from_raw_signals(
         path=unit.path,
         timestamps_ms=timestamps_ms,
@@ -665,7 +715,9 @@ def prepare_upperarm_record_from_unit(
         apply_filter=apply_filter,
         normalize_mode=normalize_mode,
         fallback_fs=fallback_fs,
-        target_fs=target_fs,
+        target_fs=effective_target_fs,
+        original_sampling_rate_hz_override=original_sampling_rate_hz,
+        sampling_rate_hz_override=effective_sampling_rate_hz,
     )
 
 
