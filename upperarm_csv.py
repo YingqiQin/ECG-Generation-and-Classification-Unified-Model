@@ -4,12 +4,14 @@ import random
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
+
+from mcma_torch.data.ui_beat_quality import ensure_ui_beat_quality_segments
 
 
 DEFAULT_TARGET_CHANNELS = [f"CH{i}" for i in range(1, 9)]
@@ -62,6 +64,10 @@ def _as_path_list(value: Iterable[str | Path] | str | Path | None) -> list[Path]
     return [Path(item) for item in value]
 
 
+def _normalize_quality_preprocess_mode(value: str | None) -> str:
+    return str(value or "none").strip().lower()
+
+
 def _discover_files(csv_dir: str | Path, file_glob: str, max_files: int | None = None) -> list[Path]:
     files = sorted(Path(csv_dir).glob(file_glob))
     if max_files is not None:
@@ -112,10 +118,23 @@ def discover_upperarm_source_units(
     max_files: int | None = None,
     segment_group_regex: str = DEFAULT_SEGMENT_GROUP_REGEX,
     segment_offset_regex: str = DEFAULT_SEGMENT_OFFSET_REGEX,
+    quality_preprocess_mode: str = "none",
+    quality_preprocess_config: dict[str, Any] | None = None,
 ) -> list[UpperArmSourceUnit]:
     files = _discover_files(csv_dir=csv_dir, file_glob=file_glob, max_files=max_files)
     if not files:
         return []
+    preprocess_mode = _normalize_quality_preprocess_mode(quality_preprocess_mode)
+    if dataset_type == "upperarm_csv" and preprocess_mode == "ui_beat":
+        cfg = quality_preprocess_config or {}
+        units: list[UpperArmSourceUnit] = []
+        for path in files:
+            logical_path, segment_paths = ensure_ui_beat_quality_segments(csv_path=path, cfg=cfg)
+            if not segment_paths:
+                print(f"Skipping {path.name}: UI_Beat produced no quality segments")
+                continue
+            units.append(UpperArmSourceUnit(path=logical_path, source_paths=segment_paths))
+        return units
     if dataset_type == "upperarm_csv":
         return [UpperArmSourceUnit(path=path, source_paths=(path,)) for path in files]
     if dataset_type == "upperarm_segmented_npz":
@@ -134,6 +153,8 @@ def discover_upperarm_source_units_from_dirs(
     max_files: int | None = None,
     segment_group_regex: str = DEFAULT_SEGMENT_GROUP_REGEX,
     segment_offset_regex: str = DEFAULT_SEGMENT_OFFSET_REGEX,
+    quality_preprocess_mode: str = "none",
+    quality_preprocess_config: dict[str, Any] | None = None,
 ) -> list[UpperArmSourceUnit]:
     units: list[UpperArmSourceUnit] = []
     for root in _as_path_list(csv_dirs):
@@ -144,6 +165,8 @@ def discover_upperarm_source_units_from_dirs(
             max_files=None,
             segment_group_regex=segment_group_regex,
             segment_offset_regex=segment_offset_regex,
+            quality_preprocess_mode=quality_preprocess_mode,
+            quality_preprocess_config=quality_preprocess_config,
         )
         units.extend(root_units)
     units = sorted(units, key=lambda unit: str(unit.path))
@@ -418,6 +441,7 @@ def _load_npz_segment(
     timestamp_key: str,
     sampling_rate_key: str | None,
     start_time_key: str | None,
+    start_time_scale: float,
     signal_matrix_key: str | None,
     channel_names_key: str | None,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
@@ -438,7 +462,7 @@ def _load_npz_segment(
                 sampling_rate_hz = float(np.asarray(npz_data[sampling_rate_key]).reshape(-1)[0])
             start_time_ms = 0.0
             if start_time_key and start_time_key in npz_data.files:
-                start_time_ms = float(np.asarray(npz_data[start_time_key]).reshape(-1)[0])
+                start_time_ms = float(np.asarray(npz_data[start_time_key]).reshape(-1)[0]) * float(start_time_scale)
             length = next(iter(signal_map.values())).shape[0]
             timestamps_ms = _build_timestamps_from_fs(
                 length=length,
@@ -555,11 +579,26 @@ def prepare_upperarm_record_from_unit(
     npz_timestamp_key: str = "timestamp_ms",
     npz_sampling_rate_key: str | None = "sampling_rate_hz",
     npz_start_time_key: str | None = "start_time_ms",
+    npz_start_time_scale: float = 1.0,
     npz_signal_matrix_key: str | None = None,
     npz_channel_names_key: str | None = None,
+    quality_preprocess_mode: str = "none",
 ) -> PreparedUpperArmRecord:
     target_channels_list = _as_channel_list(target_channels)
-    if dataset_type == "upperarm_csv":
+    preprocess_mode = _normalize_quality_preprocess_mode(quality_preprocess_mode)
+    effective_dataset_type = dataset_type
+    if (
+        dataset_type == "upperarm_csv"
+        and preprocess_mode == "ui_beat"
+        and unit.source_paths
+        and all(path.suffix.lower() == ".npz" for path in unit.source_paths)
+    ):
+        effective_dataset_type = "upperarm_segmented_npz"
+        npz_sampling_rate_key = "fs"
+        npz_start_time_key = "start_s"
+        npz_start_time_scale = 1000.0
+
+    if effective_dataset_type == "upperarm_csv":
         return prepare_upperarm_record(
             path=unit.source_paths[0],
             input_channel=input_channel,
@@ -569,8 +608,8 @@ def prepare_upperarm_record_from_unit(
             fallback_fs=fallback_fs,
             target_fs=target_fs,
         )
-    if dataset_type != "upperarm_segmented_npz":
-        raise ValueError(f"Unsupported dataset_type: {dataset_type}")
+    if effective_dataset_type != "upperarm_segmented_npz":
+        raise ValueError(f"Unsupported dataset_type: {effective_dataset_type}")
 
     timestamp_parts: list[np.ndarray] = []
     signal_parts: dict[str, list[np.ndarray]] = {
@@ -585,6 +624,7 @@ def prepare_upperarm_record_from_unit(
             timestamp_key=npz_timestamp_key,
             sampling_rate_key=npz_sampling_rate_key,
             start_time_key=npz_start_time_key,
+            start_time_scale=npz_start_time_scale,
             signal_matrix_key=npz_signal_matrix_key,
             channel_names_key=npz_channel_names_key,
         )
@@ -642,9 +682,12 @@ def load_upperarm_records(
     npz_timestamp_key: str = "timestamp_ms",
     npz_sampling_rate_key: str | None = "sampling_rate_hz",
     npz_start_time_key: str | None = "start_time_ms",
+    npz_start_time_scale: float = 1.0,
     npz_signal_matrix_key: str | None = None,
     npz_channel_names_key: str | None = None,
     csv_dirs: Iterable[str | Path] | str | Path | None = None,
+    quality_preprocess_mode: str = "none",
+    quality_preprocess_config: dict[str, Any] | None = None,
 ) -> list[PreparedUpperArmRecord]:
     roots = csv_dirs or csv_dir
     units = discover_upperarm_source_units_from_dirs(
@@ -654,9 +697,11 @@ def load_upperarm_records(
         max_files=max_files,
         segment_group_regex=segment_group_regex,
         segment_offset_regex=segment_offset_regex,
+        quality_preprocess_mode=quality_preprocess_mode,
+        quality_preprocess_config=quality_preprocess_config,
     )
     if not units:
-        raise RuntimeError(f"No files matching {file_glob} found in {csv_dir}")
+        raise RuntimeError(f"No usable files matching {file_glob} found in {csv_dir}")
     units = _split_units(
         units,
         split=split,
@@ -682,8 +727,10 @@ def load_upperarm_records(
             npz_timestamp_key=npz_timestamp_key,
             npz_sampling_rate_key=npz_sampling_rate_key,
             npz_start_time_key=npz_start_time_key,
+            npz_start_time_scale=npz_start_time_scale,
             npz_signal_matrix_key=npz_signal_matrix_key,
             npz_channel_names_key=npz_channel_names_key,
+            quality_preprocess_mode=quality_preprocess_mode,
         )
         for unit in units
     ]
@@ -717,9 +764,12 @@ class UpperArmCSVWindowsDataset(Dataset):
         npz_timestamp_key: str = "timestamp_ms",
         npz_sampling_rate_key: str | None = "sampling_rate_hz",
         npz_start_time_key: str | None = "start_time_ms",
+        npz_start_time_scale: float = 1.0,
         npz_signal_matrix_key: str | None = None,
         npz_channel_names_key: str | None = None,
         csv_dirs: Iterable[str | Path] | str | Path | None = None,
+        quality_preprocess_mode: str = "none",
+        quality_preprocess_config: dict[str, Any] | None = None,
     ) -> None:
         self.segment_length = int(segment_length)
         self.segment_stride = int(segment_stride)
@@ -749,9 +799,12 @@ class UpperArmCSVWindowsDataset(Dataset):
             npz_timestamp_key=npz_timestamp_key,
             npz_sampling_rate_key=npz_sampling_rate_key,
             npz_start_time_key=npz_start_time_key,
+            npz_start_time_scale=npz_start_time_scale,
             npz_signal_matrix_key=npz_signal_matrix_key,
             npz_channel_names_key=npz_channel_names_key,
             csv_dirs=csv_dirs,
+            quality_preprocess_mode=quality_preprocess_mode,
+            quality_preprocess_config=quality_preprocess_config,
         )
 
         self.items: list[tuple[int, int]] = []

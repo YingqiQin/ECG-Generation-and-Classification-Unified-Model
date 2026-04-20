@@ -1284,9 +1284,12 @@ def main(argv: list[str] | None = None) -> int:
         npz_timestamp_key=data_cfg.get("npz_timestamp_key", "timestamp_ms"),
         npz_sampling_rate_key=data_cfg.get("npz_sampling_rate_key", "sampling_rate_hz"),
         npz_start_time_key=data_cfg.get("npz_start_time_key", "start_time_ms"),
+        npz_start_time_scale=float(data_cfg.get("npz_start_time_scale", 1.0)),
         npz_signal_matrix_key=data_cfg.get("npz_signal_matrix_key"),
         npz_channel_names_key=data_cfg.get("npz_channel_names_key"),
         csv_dirs=data_cfg.get("csv_dirs"),
+        quality_preprocess_mode=data_cfg.get("quality_preprocess_mode", "none"),
+        quality_preprocess_config=data_cfg,
     )
 
     model = build_upperarm_model(model_cfg=model_cfg, target_channels=target_channels, device=device)

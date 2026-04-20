@@ -181,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
             max_files=data_cfg.get("max_files"),
             segment_group_regex=data_cfg.get("segment_group_regex", r"^(?P<record>.+)_\d+s$"),
             segment_offset_regex=data_cfg.get("segment_offset_regex", r"_(?P<offset_seconds>\d+)s$"),
+            quality_preprocess_mode=data_cfg.get("quality_preprocess_mode", "none"),
+            quality_preprocess_config=data_cfg,
         )
         for subject_dir in subject_dirs
     }

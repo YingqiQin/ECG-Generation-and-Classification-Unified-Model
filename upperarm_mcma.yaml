@@ -8,8 +8,22 @@ data:
   npz_timestamp_key: timestamp_ms
   npz_sampling_rate_key: sampling_rate_hz
   npz_start_time_key: start_time_ms
+  npz_start_time_scale: 1.0
   npz_signal_matrix_key: null
   npz_channel_names_key: null
+  quality_preprocess_mode: none
+  quality_preprocess_project_root: null
+  quality_preprocess_script_path: null
+  quality_preprocess_python: null
+  quality_preprocess_output_root: null
+  quality_preprocess_output_subdir: quality_segments
+  quality_preprocess_use_cache: true
+  quality_preprocess_force: false
+  quality_preprocess_fs: 1000
+  quality_preprocess_uc_thr: auto
+  quality_preprocess_gpu: "0"
+  quality_preprocess_infer_batch: 16
+  quality_preprocess_step_sec: 8.0
   input_channel: CH20
   target_channels: [CH1, CH2, CH3, CH4, CH5, CH6, CH7, CH8]
   batch_size: 64

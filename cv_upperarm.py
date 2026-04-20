@@ -96,6 +96,8 @@ def _discover_units(data_cfg: dict) -> list[UpperArmSourceUnit]:
         max_files=data_cfg.get("max_files"),
         segment_group_regex=data_cfg.get("segment_group_regex", r"^(?P<record>.+)_\d+s$"),
         segment_offset_regex=data_cfg.get("segment_offset_regex", r"_(?P<offset_seconds>\d+)s$"),
+        quality_preprocess_mode=data_cfg.get("quality_preprocess_mode", "none"),
+        quality_preprocess_config=data_cfg,
     )
     if not units:
         raise RuntimeError(f"No files matching {data_cfg.get('file_glob', 'emg_data_*.csv')} found in {data_cfg['csv_dir']}")
@@ -275,8 +277,10 @@ def _evaluate_checkpoint_on_files(
             npz_timestamp_key=data_cfg.get("npz_timestamp_key", "timestamp_ms"),
             npz_sampling_rate_key=data_cfg.get("npz_sampling_rate_key", "sampling_rate_hz"),
             npz_start_time_key=data_cfg.get("npz_start_time_key", "start_time_ms"),
+            npz_start_time_scale=float(data_cfg.get("npz_start_time_scale", 1.0)),
             npz_signal_matrix_key=data_cfg.get("npz_signal_matrix_key"),
             npz_channel_names_key=data_cfg.get("npz_channel_names_key"),
+            quality_preprocess_mode=data_cfg.get("quality_preprocess_mode", "none"),
         )
         reconstructed = reconstruct_record(
             model=model,
