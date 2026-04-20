@@ -253,29 +253,34 @@ def _save_segmented_reconstruction_comparison_plot(
     ]
 
     for page_idx, page_segments in enumerate(pages, start=1):
-        num_rows = len(page_segments)
-        num_cols = len(target_channels)
+        num_rows = len(target_channels)
+        num_cols = len(page_segments)
         fig, axes = plt.subplots(
             num_rows,
             num_cols,
-            figsize=(max(12.0, 2.8 * num_cols), max(3.2, 2.35 * num_rows)),
+            figsize=(max(12.0, 3.4 * num_cols), max(3.8, 2.45 * num_rows)),
             sharex=False,
             squeeze=False,
         )
 
-        for col_idx, lead_name in enumerate(target_channels):
-            axes[0, col_idx].set_title(lead_name, fontsize=10)
+        for col_idx, segment_slice in enumerate(page_segments):
+            segment_start_idx = segment_slice.start or 0
+            segment_stop_idx = segment_slice.stop or segment_start_idx
+            absolute_start_s = float(record.timestamps_ms[segment_start_idx] - record.timestamps_ms[0]) / 1000.0
+            absolute_end_s = float(record.timestamps_ms[segment_stop_idx - 1] - record.timestamps_ms[0]) / 1000.0
+            segment_number = (page_idx - 1) * page_size + col_idx + 1
+            axes[0, col_idx].set_title(
+                f"seg {segment_number}\n{absolute_start_s:.1f}-{absolute_end_s:.1f}s",
+                fontsize=10,
+            )
 
-        for row_idx, segment_slice in enumerate(page_segments):
+        for col_idx, segment_slice in enumerate(page_segments):
             segment_start_idx = segment_slice.start or 0
             segment_stop_idx = segment_slice.stop or segment_start_idx
             if segment_stop_idx <= segment_start_idx:
                 continue
 
-            absolute_start_s = float(record.timestamps_ms[segment_start_idx] - record.timestamps_ms[0]) / 1000.0
-            absolute_end_s = float(record.timestamps_ms[segment_stop_idx - 1] - record.timestamps_ms[0]) / 1000.0
-
-            for col_idx, (lead_name, target_display, pred_display, pred_shifted, target_label, pred_label) in enumerate(lead_series):
+            for row_idx, (lead_name, target_display, pred_display, pred_shifted, target_label, pred_label) in enumerate(lead_series):
                 ax = axes[row_idx, col_idx]
                 time_segment_s = (
                     record.timestamps_ms[segment_slice].astype(np.float64)
@@ -299,11 +304,7 @@ def _save_segmented_reconstruction_comparison_plot(
                     )
                 ax.grid(alpha=0.20)
                 if col_idx == 0:
-                    ax.set_ylabel(
-                        f"seg {page_idx + row_idx if len(pages) == 1 else (page_idx - 1) * page_size + row_idx + 1}\n"
-                        f"{absolute_start_s:.1f}-{absolute_end_s:.1f}s\namp",
-                        fontsize=9,
-                    )
+                    ax.set_ylabel(f"{lead_name}\namp", fontsize=9)
                 if row_idx == num_rows - 1:
                     ax.set_xlabel("segment time (s)")
 
@@ -317,6 +318,162 @@ def _save_segmented_reconstruction_comparison_plot(
         )
         if lag_metrics_enabled:
             title += f" | mean lag-{corr_method}={float(metrics_row[f'mean_lag_corrected_{corr_method}']):.3f}"
+        if len(pages) > 1:
+            title += f" | page {page_idx}/{len(pages)}"
+        fig.suptitle(title, fontsize=12, y=1.01)
+
+        page_output = output_path
+        if page_idx > 1:
+            page_output = output_path.with_name(f"{output_path.stem}_page{page_idx:02d}{output_path.suffix}")
+        page_output.parent.mkdir(parents=True, exist_ok=True)
+        fig.tight_layout()
+        fig.savefig(page_output, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+
+
+def _segment_focus_center(
+    signal: np.ndarray,
+    sampling_rate_hz: float,
+    half_window_samples: int,
+) -> int:
+    centers = _select_focus_centers(
+        signal=signal,
+        sampling_rate_hz=sampling_rate_hz,
+        num_beats=1,
+        half_window_samples=half_window_samples,
+    )
+    if centers.size == 0:
+        return max(0, min(signal.shape[0] - 1, signal.shape[0] // 2))
+    return int(centers[0])
+
+
+def _save_segmented_focus_lead_plot(
+    output_path: Path,
+    record: PreparedUpperArmRecord,
+    lead_name: str,
+    target: np.ndarray,
+    pred: np.ndarray,
+    pred_shifted: np.ndarray | None,
+    target_label: str,
+    pred_label: str,
+    metrics_row: dict[str, object],
+    corr_method: str,
+    lag_metrics_enabled: bool,
+    half_window_samples: int,
+    max_plot_samples: int,
+    dpi: int,
+    max_segments_per_figure: int = 4,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    gap_threshold_s = _estimate_gap_break_threshold_s(record.timestamps_ms)
+    segment_slices = _segment_slices_from_timestamps(record.timestamps_ms, gap_threshold_s=gap_threshold_s)
+    if not segment_slices:
+        return
+
+    page_size = max(1, int(max_segments_per_figure))
+    pages = [
+        segment_slices[start:start + page_size]
+        for start in range(0, len(segment_slices), page_size)
+    ]
+
+    for page_idx, page_segments in enumerate(pages, start=1):
+        num_cols = len(page_segments)
+        fig, axes = plt.subplots(
+            2,
+            num_cols,
+            figsize=(max(12.0, 3.8 * num_cols), 7.2),
+            sharex=False,
+            squeeze=False,
+            gridspec_kw={"height_ratios": [1.5, 1.0]},
+        )
+
+        for col_idx, segment_slice in enumerate(page_segments):
+            seg_start = segment_slice.start or 0
+            seg_stop = segment_slice.stop or seg_start
+            if seg_stop <= seg_start:
+                continue
+
+            segment_number = (page_idx - 1) * page_size + col_idx + 1
+            absolute_start_s = float(record.timestamps_ms[seg_start] - record.timestamps_ms[0]) / 1000.0
+            absolute_end_s = float(record.timestamps_ms[seg_stop - 1] - record.timestamps_ms[0]) / 1000.0
+
+            segment_time_s = (
+                record.timestamps_ms[segment_slice].astype(np.float64)
+                - float(record.timestamps_ms[seg_start])
+            ) / 1000.0
+            if max_plot_samples > 0 and segment_time_s.shape[0] > max_plot_samples:
+                overview_stride = int(math.ceil(segment_time_s.shape[0] / max_plot_samples))
+            else:
+                overview_stride = 1
+
+            segment_target = target[segment_slice]
+            segment_pred = pred[segment_slice]
+            segment_pred_shifted = pred_shifted[segment_slice] if pred_shifted is not None else None
+
+            center_local = _segment_focus_center(
+                signal=segment_target,
+                sampling_rate_hz=max(float(record.sampling_rate_hz), 1.0),
+                half_window_samples=min(half_window_samples, max(8, segment_target.shape[0] // 2)),
+            )
+            local_half_window = min(half_window_samples, max(8, segment_target.shape[0] // 2))
+            left = max(0, center_local - local_half_window)
+            right = min(segment_target.shape[0], center_local + local_half_window)
+
+            overview_ax = axes[0, col_idx]
+            overview_ax.plot(segment_time_s[::overview_stride], segment_target[::overview_stride], color="black", linewidth=1.0, label=target_label)
+            overview_ax.plot(segment_time_s[::overview_stride], segment_pred[::overview_stride], color="red", linewidth=1.0, alpha=0.82, label=pred_label)
+            if lag_metrics_enabled and segment_pred_shifted is not None:
+                overview_ax.plot(
+                    segment_time_s[::overview_stride],
+                    segment_pred_shifted[::overview_stride],
+                    color="#1f77b4",
+                    linewidth=1.0,
+                    alpha=0.85,
+                    linestyle="--",
+                    label="lag-corrected recon",
+                )
+            overview_ax.axvspan(segment_time_s[left], segment_time_s[max(left, right - 1)], color="gold", alpha=0.18)
+            overview_ax.grid(alpha=0.20)
+            overview_ax.set_title(
+                f"seg {segment_number}\n{absolute_start_s:.1f}-{absolute_end_s:.1f}s",
+                fontsize=10,
+            )
+            if col_idx == 0:
+                overview_ax.set_ylabel(f"{lead_name}\namp")
+
+            zoom_ax = axes[1, col_idx]
+            zoom_time_ms = (segment_time_s[left:right] - segment_time_s[center_local]) * 1000.0
+            zoom_ax.plot(zoom_time_ms, segment_target[left:right], color="black", linewidth=1.2, label=target_label)
+            zoom_ax.plot(zoom_time_ms, segment_pred[left:right], color="red", linewidth=1.2, alpha=0.85, label=pred_label)
+            if lag_metrics_enabled and segment_pred_shifted is not None:
+                zoom_ax.plot(
+                    zoom_time_ms,
+                    segment_pred_shifted[left:right],
+                    color="#1f77b4",
+                    linewidth=1.1,
+                    alpha=0.85,
+                    linestyle="--",
+                    label="lag-corrected recon",
+                )
+            zoom_ax.axvline(0.0, color="gray", linestyle="--", linewidth=0.8, alpha=0.8)
+            zoom_ax.grid(alpha=0.25)
+            zoom_ax.set_xlabel("time relative to center (ms)")
+            if col_idx == 0:
+                zoom_ax.set_ylabel("zoom\namp")
+
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels, loc="upper right")
+        title = (
+            f"{record.path.name} | focus_lead={lead_name} | segmented focus | "
+            f"raw {corr_method}={float(metrics_row[f'{lead_name}_{corr_method}']):.3f}"
+        )
+        if lag_metrics_enabled:
+            title += f" | lag-{corr_method}={float(metrics_row[f'{lead_name}_lag_corrected_{corr_method}']):.3f}"
         if len(pages) > 1:
             title += f" | page {page_idx}/{len(pages)}"
         fig.suptitle(title, fontsize=12, y=1.01)
@@ -1134,6 +1291,28 @@ def save_focus_lead_plot(
     )
     sampling_rate_hz = max(float(record.sampling_rate_hz), 1.0)
     half_window_samples = max(8, int(round((window_ms / 1000.0) * sampling_rate_hz / 2.0)))
+    segment_slices = _segment_slices_from_timestamps(record.timestamps_ms, gap_threshold_s=gap_threshold_s)
+    lag_samples = int(round(float(metrics_row.get(f"{lead_name}_best_lag_samples", 0.0))))
+    pred_shifted = _shift_for_plot(pred, lag_samples)
+    if len(segment_slices) > 1:
+        _save_segmented_focus_lead_plot(
+            output_path=output_path,
+            record=record,
+            lead_name=lead_name,
+            target=target,
+            pred=pred,
+            pred_shifted=pred_shifted if lag_metrics_enabled else None,
+            target_label=target_label,
+            pred_label=pred_label,
+            metrics_row=metrics_row,
+            corr_method=corr_method,
+            lag_metrics_enabled=lag_metrics_enabled,
+            half_window_samples=half_window_samples,
+            max_plot_samples=max_plot_samples,
+            dpi=dpi,
+        )
+        return lead_name, lead_idx
+
     centers = _select_focus_centers(
         signal=target,
         sampling_rate_hz=sampling_rate_hz,
@@ -1158,8 +1337,6 @@ def save_focus_lead_plot(
     axes_array = np.atleast_1d(axes).reshape(-1)
 
     overview_ax = axes_array[0]
-    lag_samples = int(round(float(metrics_row.get(f"{lead_name}_best_lag_samples", 0.0))))
-    pred_shifted = _shift_for_plot(pred, lag_samples)
     overview_time, overview_signals = _apply_gap_breaks(
         time_s=time_s,
         signals=[target, pred, pred_shifted],
