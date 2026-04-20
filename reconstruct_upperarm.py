@@ -166,6 +166,39 @@ def _prepare_display_signals(
     raise ValueError(f"Unsupported visual_filter_mode: {visual_filter_mode}")
 
 
+def _estimate_gap_break_threshold_s(timestamps_ms: np.ndarray, factor: float = 1.5) -> float:
+    timestamps_ms = np.asarray(timestamps_ms, dtype=np.float64).reshape(-1)
+    if timestamps_ms.size < 3:
+        return float("inf")
+    diffs_ms = np.diff(timestamps_ms)
+    diffs_ms = diffs_ms[np.isfinite(diffs_ms) & (diffs_ms > 0)]
+    if diffs_ms.size == 0:
+        return float("inf")
+    nominal_step_ms = float(np.median(diffs_ms))
+    if nominal_step_ms <= 0:
+        return float("inf")
+    return (nominal_step_ms * max(factor, 1.01)) / 1000.0
+
+
+def _apply_gap_breaks(
+    time_s: np.ndarray,
+    signals: list[np.ndarray],
+    gap_threshold_s: float,
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    time_values = np.asarray(time_s, dtype=np.float64).reshape(-1)
+    output_signals = [np.asarray(signal, dtype=np.float32).reshape(-1).copy() for signal in signals]
+    if time_values.size < 2 or not np.isfinite(gap_threshold_s):
+        return time_values, output_signals
+
+    gap_indices = np.where(np.diff(time_values) > gap_threshold_s)[0] + 1
+    if gap_indices.size == 0:
+        return time_values, output_signals
+
+    for signal in output_signals:
+        signal[gap_indices] = np.nan
+    return time_values, output_signals
+
+
 def _bounded_xcorr_metrics(
     target: np.ndarray,
     pred: np.ndarray,
@@ -838,11 +871,11 @@ def save_reconstruction_comparison_plot(
     axes_array = np.atleast_1d(axes).reshape(-1)
 
     time_s = (record.timestamps_ms.astype(np.float64) - float(record.timestamps_ms[0])) / 1000.0
+    gap_threshold_s = _estimate_gap_break_threshold_s(record.timestamps_ms)
     if max_plot_samples > 0 and time_s.shape[0] > max_plot_samples:
         stride = int(math.ceil(time_s.shape[0] / max_plot_samples))
     else:
         stride = 1
-    time_plot = time_s[::stride]
 
     corr_method = str(metrics_row.get("corr_method", "pearson"))
     lag_metrics_enabled = bool(metrics_row.get("lag_metrics_enabled", True))
@@ -854,14 +887,21 @@ def save_reconstruction_comparison_plot(
             sampling_rate_hz=float(record.sampling_rate_hz),
             visual_filter_mode=visual_filter_mode,
         )
-        target = target_display[::stride]
-        pred = pred_display[::stride]
         lag_samples = int(round(float(metrics_row.get(f"{lead_name}_best_lag_samples", 0.0))))
-        pred_shifted = _shift_for_plot(pred_display, lag_samples)[::stride]
+        pred_shifted = _shift_for_plot(pred_display, lag_samples)
+        gap_broken_time, gap_broken_signals = _apply_gap_breaks(
+            time_s=time_s,
+            signals=[target_display, pred_display, pred_shifted],
+            gap_threshold_s=gap_threshold_s,
+        )
+        time_plot = gap_broken_time[::stride]
+        target = gap_broken_signals[0][::stride]
+        pred = gap_broken_signals[1][::stride]
+        pred_shifted_plot = gap_broken_signals[2][::stride]
         ax.plot(time_plot, target, color="black", linewidth=1.0, label=target_label)
         ax.plot(time_plot, pred, color="red", linewidth=1.0, alpha=0.8, label=pred_label)
         if lag_metrics_enabled:
-            ax.plot(time_plot, pred_shifted, color="#1f77b4", linewidth=1.0, alpha=0.85, linestyle="--", label="lag-corrected recon")
+            ax.plot(time_plot, pred_shifted_plot, color="#1f77b4", linewidth=1.0, alpha=0.85, linestyle="--", label="lag-corrected recon")
         corr_value = float(metrics_row.get(f"{lead_name}_{corr_method}", float("nan")))
         rmse_value = float(metrics_row.get(f"{lead_name}_rmse", float("nan")))
         if lag_metrics_enabled:
@@ -935,6 +975,7 @@ def save_focus_lead_plot(
     )
 
     time_s = (record.timestamps_ms.astype(np.float64) - float(record.timestamps_ms[0])) / 1000.0
+    gap_threshold_s = _estimate_gap_break_threshold_s(record.timestamps_ms)
     target, pred, target_label, pred_label = _prepare_display_signals(
         target=record.target_signals[lead_idx],
         pred=reconstructed[lead_idx],
@@ -969,10 +1010,15 @@ def save_focus_lead_plot(
     overview_ax = axes_array[0]
     lag_samples = int(round(float(metrics_row.get(f"{lead_name}_best_lag_samples", 0.0))))
     pred_shifted = _shift_for_plot(pred, lag_samples)
-    overview_ax.plot(time_s[::overview_stride], target[::overview_stride], color="black", linewidth=1.0, label=target_label)
-    overview_ax.plot(time_s[::overview_stride], pred[::overview_stride], color="red", linewidth=1.0, alpha=0.8, label=pred_label)
+    overview_time, overview_signals = _apply_gap_breaks(
+        time_s=time_s,
+        signals=[target, pred, pred_shifted],
+        gap_threshold_s=gap_threshold_s,
+    )
+    overview_ax.plot(overview_time[::overview_stride], overview_signals[0][::overview_stride], color="black", linewidth=1.0, label=target_label)
+    overview_ax.plot(overview_time[::overview_stride], overview_signals[1][::overview_stride], color="red", linewidth=1.0, alpha=0.8, label=pred_label)
     if lag_metrics_enabled:
-        overview_ax.plot(time_s[::overview_stride], pred_shifted[::overview_stride], color="#1f77b4", linewidth=1.0, alpha=0.85, linestyle="--", label="lag-corrected recon")
+        overview_ax.plot(overview_time[::overview_stride], overview_signals[2][::overview_stride], color="#1f77b4", linewidth=1.0, alpha=0.85, linestyle="--", label="lag-corrected recon")
     for center in centers:
         left = max(0, int(center) - half_window_samples)
         right = min(target.shape[0], int(center) + half_window_samples)
@@ -1001,10 +1047,16 @@ def save_focus_lead_plot(
         left = max(0, int(center) - half_window_samples)
         right = min(target.shape[0], int(center) + half_window_samples)
         segment_time_ms = (time_s[left:right] - time_s[int(center)]) * 1000.0
-        ax.plot(segment_time_ms, target[left:right], color="black", linewidth=1.2, label=target_label)
-        ax.plot(segment_time_ms, pred[left:right], color="red", linewidth=1.2, alpha=0.85, label=pred_label)
+        zoom_time, zoom_signals = _apply_gap_breaks(
+            time_s=segment_time_ms / 1000.0,
+            signals=[target[left:right], pred[left:right], pred_shifted[left:right]],
+            gap_threshold_s=gap_threshold_s,
+        )
+        zoom_time_ms = zoom_time * 1000.0
+        ax.plot(zoom_time_ms, zoom_signals[0], color="black", linewidth=1.2, label=target_label)
+        ax.plot(zoom_time_ms, zoom_signals[1], color="red", linewidth=1.2, alpha=0.85, label=pred_label)
         if lag_metrics_enabled:
-            ax.plot(segment_time_ms, pred_shifted[left:right], color="#1f77b4", linewidth=1.1, alpha=0.85, linestyle="--", label="lag-corrected recon")
+            ax.plot(zoom_time_ms, zoom_signals[2], color="#1f77b4", linewidth=1.1, alpha=0.85, linestyle="--", label="lag-corrected recon")
         ax.axvline(0.0, color="gray", linestyle="--", linewidth=0.8, alpha=0.8)
         ax.set_ylabel("amp")
         ax.grid(alpha=0.25)
