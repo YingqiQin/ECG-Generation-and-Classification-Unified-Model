@@ -199,6 +199,137 @@ def _apply_gap_breaks(
     return time_values, output_signals
 
 
+def _segment_slices_from_timestamps(
+    timestamps_ms: np.ndarray,
+    gap_threshold_s: float,
+) -> list[slice]:
+    timestamps_ms = np.asarray(timestamps_ms, dtype=np.float64).reshape(-1)
+    if timestamps_ms.size == 0:
+        return []
+    if timestamps_ms.size == 1 or not np.isfinite(gap_threshold_s):
+        return [slice(0, timestamps_ms.size)]
+
+    time_s = (timestamps_ms - float(timestamps_ms[0])) / 1000.0
+    gap_indices = np.where(np.diff(time_s) > gap_threshold_s)[0] + 1
+    if gap_indices.size == 0:
+        return [slice(0, timestamps_ms.size)]
+
+    slices: list[slice] = []
+    start = 0
+    for stop in gap_indices.tolist():
+        if stop > start:
+            slices.append(slice(start, stop))
+        start = stop
+    if start < timestamps_ms.size:
+        slices.append(slice(start, timestamps_ms.size))
+    return slices
+
+
+def _save_segmented_reconstruction_comparison_plot(
+    output_path: Path,
+    record: PreparedUpperArmRecord,
+    target_channels: list[str],
+    metrics_row: dict[str, object],
+    lead_series: list[tuple[str, np.ndarray, np.ndarray, np.ndarray | None, str, str]],
+    segment_slices: list[slice],
+    max_plot_samples: int,
+    dpi: int,
+    max_segments_per_figure: int = 6,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    if not segment_slices:
+        return
+
+    corr_method = str(metrics_row.get("corr_method", "pearson"))
+    lag_metrics_enabled = bool(metrics_row.get("lag_metrics_enabled", True))
+    page_size = max(1, int(max_segments_per_figure))
+    pages = [
+        segment_slices[start:start + page_size]
+        for start in range(0, len(segment_slices), page_size)
+    ]
+
+    for page_idx, page_segments in enumerate(pages, start=1):
+        num_rows = len(page_segments)
+        num_cols = len(target_channels)
+        fig, axes = plt.subplots(
+            num_rows,
+            num_cols,
+            figsize=(max(12.0, 2.8 * num_cols), max(3.2, 2.35 * num_rows)),
+            sharex=False,
+            squeeze=False,
+        )
+
+        for col_idx, lead_name in enumerate(target_channels):
+            axes[0, col_idx].set_title(lead_name, fontsize=10)
+
+        for row_idx, segment_slice in enumerate(page_segments):
+            segment_start_idx = segment_slice.start or 0
+            segment_stop_idx = segment_slice.stop or segment_start_idx
+            if segment_stop_idx <= segment_start_idx:
+                continue
+
+            absolute_start_s = float(record.timestamps_ms[segment_start_idx] - record.timestamps_ms[0]) / 1000.0
+            absolute_end_s = float(record.timestamps_ms[segment_stop_idx - 1] - record.timestamps_ms[0]) / 1000.0
+
+            for col_idx, (lead_name, target_display, pred_display, pred_shifted, target_label, pred_label) in enumerate(lead_series):
+                ax = axes[row_idx, col_idx]
+                time_segment_s = (
+                    record.timestamps_ms[segment_slice].astype(np.float64)
+                    - float(record.timestamps_ms[segment_start_idx])
+                ) / 1000.0
+                if max_plot_samples > 0 and time_segment_s.shape[0] > max_plot_samples:
+                    stride = int(math.ceil(time_segment_s.shape[0] / max_plot_samples))
+                else:
+                    stride = 1
+                ax.plot(time_segment_s[::stride], target_display[segment_slice][::stride], color="black", linewidth=1.0, label=target_label)
+                ax.plot(time_segment_s[::stride], pred_display[segment_slice][::stride], color="red", linewidth=1.0, alpha=0.82, label=pred_label)
+                if lag_metrics_enabled and pred_shifted is not None:
+                    ax.plot(
+                        time_segment_s[::stride],
+                        pred_shifted[segment_slice][::stride],
+                        color="#1f77b4",
+                        linewidth=1.0,
+                        alpha=0.85,
+                        linestyle="--",
+                        label="lag-corrected recon",
+                    )
+                ax.grid(alpha=0.20)
+                if col_idx == 0:
+                    ax.set_ylabel(
+                        f"seg {page_idx + row_idx if len(pages) == 1 else (page_idx - 1) * page_size + row_idx + 1}\n"
+                        f"{absolute_start_s:.1f}-{absolute_end_s:.1f}s\namp",
+                        fontsize=9,
+                    )
+                if row_idx == num_rows - 1:
+                    ax.set_xlabel("segment time (s)")
+
+        handles, labels = axes[0, 0].get_legend_handles_labels()
+        if handles:
+            fig.legend(handles, labels, loc="upper right")
+
+        title = (
+            f"{record.path.name} | segmented comparison | kept segments={len(segment_slices)} | "
+            f"mean {corr_method}={float(metrics_row[f'mean_{corr_method}']):.3f}"
+        )
+        if lag_metrics_enabled:
+            title += f" | mean lag-{corr_method}={float(metrics_row[f'mean_lag_corrected_{corr_method}']):.3f}"
+        if len(pages) > 1:
+            title += f" | page {page_idx}/{len(pages)}"
+        fig.suptitle(title, fontsize=12, y=1.01)
+
+        page_output = output_path
+        if page_idx > 1:
+            page_output = output_path.with_name(f"{output_path.stem}_page{page_idx:02d}{output_path.suffix}")
+        page_output.parent.mkdir(parents=True, exist_ok=True)
+        fig.tight_layout()
+        fig.savefig(page_output, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+
+
 def _bounded_xcorr_metrics(
     target: np.ndarray,
     pred: np.ndarray,
@@ -872,6 +1003,7 @@ def save_reconstruction_comparison_plot(
 
     time_s = (record.timestamps_ms.astype(np.float64) - float(record.timestamps_ms[0])) / 1000.0
     gap_threshold_s = _estimate_gap_break_threshold_s(record.timestamps_ms)
+    segment_slices = _segment_slices_from_timestamps(record.timestamps_ms, gap_threshold_s=gap_threshold_s)
     if max_plot_samples > 0 and time_s.shape[0] > max_plot_samples:
         stride = int(math.ceil(time_s.shape[0] / max_plot_samples))
     else:
@@ -879,8 +1011,8 @@ def save_reconstruction_comparison_plot(
 
     corr_method = str(metrics_row.get("corr_method", "pearson"))
     lag_metrics_enabled = bool(metrics_row.get("lag_metrics_enabled", True))
+    lead_series: list[tuple[str, np.ndarray, np.ndarray, np.ndarray | None, str, str]] = []
     for lead_idx, lead_name in enumerate(target_channels):
-        ax = axes_array[lead_idx]
         target_display, pred_display, target_label, pred_label = _prepare_display_signals(
             target=record.target_signals[lead_idx],
             pred=reconstructed[lead_idx],
@@ -889,9 +1021,27 @@ def save_reconstruction_comparison_plot(
         )
         lag_samples = int(round(float(metrics_row.get(f"{lead_name}_best_lag_samples", 0.0))))
         pred_shifted = _shift_for_plot(pred_display, lag_samples)
+        lead_series.append((lead_name, target_display, pred_display, pred_shifted if lag_metrics_enabled else None, target_label, pred_label))
+
+    if len(segment_slices) > 1:
+        plt.close(fig)
+        _save_segmented_reconstruction_comparison_plot(
+            output_path=output_path,
+            record=record,
+            target_channels=target_channels,
+            metrics_row=metrics_row,
+            lead_series=lead_series,
+            segment_slices=segment_slices,
+            max_plot_samples=max_plot_samples,
+            dpi=dpi,
+        )
+        return
+
+    for lead_idx, (lead_name, target_display, pred_display, pred_shifted, target_label, pred_label) in enumerate(lead_series):
+        ax = axes_array[lead_idx]
         gap_broken_time, gap_broken_signals = _apply_gap_breaks(
             time_s=time_s,
-            signals=[target_display, pred_display, pred_shifted],
+            signals=[target_display, pred_display, pred_shifted if pred_shifted is not None else pred_display],
             gap_threshold_s=gap_threshold_s,
         )
         time_plot = gap_broken_time[::stride]
@@ -900,7 +1050,7 @@ def save_reconstruction_comparison_plot(
         pred_shifted_plot = gap_broken_signals[2][::stride]
         ax.plot(time_plot, target, color="black", linewidth=1.0, label=target_label)
         ax.plot(time_plot, pred, color="red", linewidth=1.0, alpha=0.8, label=pred_label)
-        if lag_metrics_enabled:
+        if lag_metrics_enabled and pred_shifted is not None:
             ax.plot(time_plot, pred_shifted_plot, color="#1f77b4", linewidth=1.0, alpha=0.85, linestyle="--", label="lag-corrected recon")
         corr_value = float(metrics_row.get(f"{lead_name}_{corr_method}", float("nan")))
         rmse_value = float(metrics_row.get(f"{lead_name}_rmse", float("nan")))
