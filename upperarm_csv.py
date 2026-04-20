@@ -68,8 +68,17 @@ def _normalize_quality_preprocess_mode(value: str | None) -> str:
     return str(value or "none").strip().lower()
 
 
+def _is_generated_sidecar_csv(path: Path) -> bool:
+    stem = path.stem
+    return stem.endswith("_quality_report") or stem.endswith("_CH1-8_rpeaks") or stem.endswith("_CH20_rpeaks")
+
+
 def _discover_files(csv_dir: str | Path, file_glob: str, max_files: int | None = None) -> list[Path]:
-    files = sorted(Path(csv_dir).glob(file_glob))
+    files = sorted(
+        path
+        for path in Path(csv_dir).glob(file_glob)
+        if not _is_generated_sidecar_csv(path)
+    )
     if max_files is not None:
         files = files[:max_files]
     return files
