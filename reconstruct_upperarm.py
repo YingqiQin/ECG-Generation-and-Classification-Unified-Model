@@ -715,24 +715,43 @@ def save_signal_stage_plot(
     else:
         stride = 1
 
-    lead_names = ["CH20", *target_channels]
-    lead_signals = [input_signal, *[target_signals[idx] for idx in range(target_signals.shape[0])]]
-    num_rows = len(lead_names)
-    fig, axes = plt.subplots(num_rows, 1, figsize=(14, max(3.0, 2.2 * num_rows)), sharex=True, squeeze=False)
-    axes_array = axes.reshape(-1)
+    if stage_key == "raw":
+        fig, ax = plt.subplots(1, 1, figsize=(14, 5.2))
+        color_map = plt.get_cmap("tab10")
+        lead_names = ["CH20", *target_channels]
+        lead_signals = [input_signal, *[target_signals[idx] for idx in range(target_signals.shape[0])]]
+        lead_colors = ["black", *[color_map(idx % 10) for idx in range(len(target_channels))]]
 
-    for row_idx, (lead_name, signal) in enumerate(zip(lead_names, lead_signals, strict=False)):
-        ax = axes_array[row_idx]
         broken_time, broken_signals = _apply_gap_breaks(
             time_s=time_s,
-            signals=[signal],
+            signals=lead_signals,
             gap_threshold_s=gap_threshold_s,
         )
-        ax.plot(broken_time[::stride], broken_signals[0][::stride], color="black", linewidth=1.0)
+        for lead_name, signal, color in zip(lead_names, broken_signals, lead_colors, strict=False):
+            ax.plot(
+                broken_time[::stride],
+                signal[::stride],
+                linewidth=1.0 if lead_name != "CH20" else 1.2,
+                color=color,
+                alpha=0.90 if lead_name == "CH20" else 0.82,
+                label=lead_name,
+            )
         ax.grid(alpha=0.20)
-        ax.set_ylabel(f"{lead_name}\n{y_label}", fontsize=9)
-        if row_idx == num_rows - 1:
-            ax.set_xlabel("time (s)")
+        ax.set_ylabel(y_label, fontsize=10)
+        ax.set_xlabel("time (s)")
+        ax.legend(loc="upper right", ncol=min(3, len(lead_names)), fontsize=8, frameon=True)
+    else:
+        fig, ax = plt.subplots(1, 1, figsize=(14, 4.4))
+        broken_time, broken_signals = _apply_gap_breaks(
+            time_s=time_s,
+            signals=[input_signal],
+            gap_threshold_s=gap_threshold_s,
+        )
+        ax.plot(broken_time[::stride], broken_signals[0][::stride], color="black", linewidth=1.1, label="CH20")
+        ax.grid(alpha=0.20)
+        ax.set_ylabel(f"CH20\n{y_label}", fontsize=10)
+        ax.set_xlabel("time (s)")
+        ax.legend(loc="upper right", fontsize=8, frameon=True)
 
     fig.suptitle(
         (
