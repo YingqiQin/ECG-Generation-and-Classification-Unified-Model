@@ -266,6 +266,7 @@ def _evaluate_checkpoint_on_files(
     visual_filter_mode = str(reconstruct_cfg.get("visual_filter_mode", "recon_only"))
     enable_lag_metrics = bool(reconstruct_cfg.get("enable_lag_metrics", True))
     show_segment_metrics = bool(reconstruct_cfg.get("show_segment_metrics", False))
+    show_rmse_in_titles = bool(reconstruct_cfg.get("show_rmse_in_titles", True))
 
     rows: list[dict[str, object]] = []
     for unit in files:
@@ -329,6 +330,7 @@ def _evaluate_checkpoint_on_files(
                 max_plot_samples=max_plot_samples,
                 dpi=plot_dpi,
                 show_segment_metrics=show_segment_metrics,
+                show_rmse_in_titles=show_rmse_in_titles,
             )
             row["plot_path"] = str(plot_path)
         if focus_plot_dir is not None:
@@ -346,6 +348,7 @@ def _evaluate_checkpoint_on_files(
                 max_plot_samples=max_plot_samples,
                 dpi=focus_plot_dpi,
                 show_segment_metrics=show_segment_metrics,
+                show_rmse_in_titles=show_rmse_in_titles,
             )
             row["focus_lead"] = selected_focus_lead
             row["focus_plot_path"] = str(focus_plot_path)

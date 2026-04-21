@@ -1299,6 +1299,7 @@ def save_reconstruction_comparison_plot(
     max_plot_samples: int = 4000,
     dpi: int = 150,
     show_segment_metrics: bool = False,
+    show_rmse_in_titles: bool = True,
 ) -> None:
     import matplotlib
 
@@ -1369,12 +1370,22 @@ def save_reconstruction_comparison_plot(
             lag_corr_value = float(metrics_row.get(f"{lead_name}_lag_corrected_{corr_method}", float("nan")))
             lag_ms_value = float(metrics_row.get(f"{lead_name}_best_lag_ms", float("nan")))
             lag_rmse_value = float(metrics_row.get(f"{lead_name}_lag_corrected_rmse", float("nan")))
-            title = (
-                f"{lead_name} | raw {corr_method}={corr_value:.3f} | lag {lag_ms_value:.1f} ms | "
-                f"lag-{corr_method}={lag_corr_value:.3f} | raw/lag-rmse={rmse_value:.3f}/{lag_rmse_value:.3f}"
-            )
+            if show_rmse_in_titles:
+                title = (
+                    f"{lead_name} | raw {corr_method}={corr_value:.3f} | lag {lag_ms_value:.1f} ms | "
+                    f"lag-{corr_method}={lag_corr_value:.3f} | raw/lag-rmse={rmse_value:.3f}/{lag_rmse_value:.3f}"
+                )
+            else:
+                title = (
+                    f"{lead_name} | raw {corr_method}={corr_value:.3f} | lag {lag_ms_value:.1f} ms | "
+                    f"lag-{corr_method}={lag_corr_value:.3f}"
+                )
         else:
-            title = f"{lead_name} | {corr_method}={corr_value:.3f} | rmse={rmse_value:.3f}"
+            title = (
+                f"{lead_name} | {corr_method}={corr_value:.3f} | rmse={rmse_value:.3f}"
+                if show_rmse_in_titles
+                else f"{lead_name} | {corr_method}={corr_value:.3f}"
+            )
         ax.set_title(title, fontsize=10)
         ax.grid(alpha=0.2)
         if lead_idx % cols == 0:
@@ -1398,9 +1409,10 @@ def save_reconstruction_comparison_plot(
         subtitle = (
             f"{record.path.name} | original_fs={record.original_sampling_rate_hz:.1f} Hz "
             f"-> eval_fs={record.sampling_rate_hz:.1f} Hz | "
-            f"mean {corr_method}={float(metrics_row[f'mean_{corr_method}']):.3f} | "
-            f"mean rmse={float(metrics_row['mean_rmse']):.3f}"
+            f"mean {corr_method}={float(metrics_row[f'mean_{corr_method}']):.3f}"
         )
+        if show_rmse_in_titles:
+            subtitle += f" | mean rmse={float(metrics_row['mean_rmse']):.3f}"
     fig.suptitle(subtitle, fontsize=12, y=1.01)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
@@ -1421,6 +1433,7 @@ def save_focus_lead_plot(
     max_plot_samples: int = 4000,
     dpi: int = 180,
     show_segment_metrics: bool = False,
+    show_rmse_in_titles: bool = True,
 ) -> tuple[str, int]:
     import matplotlib
 
@@ -1520,6 +1533,8 @@ def save_focus_lead_plot(
             f"{lead_name} full trace | {corr_method}={float(metrics_row[f'{lead_name}_{corr_method}']):.3f} | "
             f"rmse={float(metrics_row[f'{lead_name}_rmse']):.3f}"
         )
+        if not show_rmse_in_titles:
+            overview_title = f"{lead_name} full trace | {corr_method}={float(metrics_row[f'{lead_name}_{corr_method}']):.3f}"
     overview_ax.set_title(overview_title, fontsize=11)
 
     if centers.shape[0] == 0:
@@ -1775,6 +1790,7 @@ def main(argv: list[str] | None = None) -> int:
     plot_dir = ensure_dir(plot_dir_value) if plot_dir_value else output_dir / "plots"
     max_plot_samples = int(reconstruct_cfg.get("max_plot_samples", 4000))
     plot_dpi = int(reconstruct_cfg.get("plot_dpi", 150))
+    show_rmse_in_titles = bool(reconstruct_cfg.get("show_rmse_in_titles", True))
     save_signal_stage_plots = bool(reconstruct_cfg.get("save_signal_stage_plots", False))
     signal_stage_plot_dir_value = reconstruct_cfg.get("signal_stage_plot_dir")
     signal_stage_plot_dir = (
@@ -1924,6 +1940,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_plot_samples=max_plot_samples,
                 dpi=plot_dpi,
                 show_segment_metrics=show_segment_metrics,
+                show_rmse_in_titles=show_rmse_in_titles,
             )
             row["plot_path"] = str(plot_path)
         if save_focus_plots:
@@ -1941,6 +1958,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_plot_samples=max_plot_samples,
                 dpi=focus_plot_dpi,
                 show_segment_metrics=show_segment_metrics,
+                show_rmse_in_titles=show_rmse_in_titles,
             )
             row["focus_lead"] = selected_focus_lead
             row["focus_plot_path"] = str(focus_plot_path)
