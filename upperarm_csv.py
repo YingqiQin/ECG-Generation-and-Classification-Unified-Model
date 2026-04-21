@@ -24,7 +24,9 @@ DEFAULT_SEGMENT_OFFSET_REGEX = r"_(?P<offset_seconds>\d+)s$"
 class PreparedUpperArmRecord:
     path: Path
     timestamps_ms: np.ndarray
+    raw_input_signal: np.ndarray
     input_signal: np.ndarray
+    raw_target_signals: np.ndarray
     target_signals: np.ndarray
     target_channel_names: tuple[str, ...]
     original_sampling_rate_hz: float
@@ -556,6 +558,10 @@ def _prepare_record_from_raw_signals(
         sampling_rate_hz = original_sampling_rate_hz
 
     processed: dict[str, np.ndarray] = {}
+    raw_processed_grid: dict[str, np.ndarray] = {
+        channel: np.asarray(raw_signals[channel], dtype=np.float32).reshape(-1).copy()
+        for channel in [input_channel, *target_channels]
+    }
     for channel in [input_channel, *target_channels]:
         signal = raw_signals[channel]
         if apply_filter:
@@ -566,7 +572,9 @@ def _prepare_record_from_raw_signals(
     return PreparedUpperArmRecord(
         path=path,
         timestamps_ms=timestamps_ms,
+        raw_input_signal=raw_processed_grid[input_channel],
         input_signal=processed[input_channel],
+        raw_target_signals=np.stack([raw_processed_grid[channel] for channel in target_channels], axis=0),
         target_signals=np.stack([processed[channel] for channel in target_channels], axis=0),
         target_channel_names=tuple(target_channels),
         original_sampling_rate_hz=original_sampling_rate_hz,

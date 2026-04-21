@@ -681,6 +681,74 @@ def _write_reconstruction_csv(
             )
 
 
+def save_signal_stage_plot(
+    output_path: Path,
+    record: PreparedUpperArmRecord,
+    target_channels: list[str],
+    stage: str,
+    max_plot_samples: int = 4000,
+    dpi: int = 150,
+) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    stage_key = str(stage).strip().lower()
+    if stage_key == "raw":
+        input_signal = record.raw_input_signal
+        target_signals = record.raw_target_signals
+        stage_label = "raw"
+        y_label = "raw amp"
+    elif stage_key == "processed":
+        input_signal = record.input_signal
+        target_signals = record.target_signals
+        stage_label = "processed"
+        y_label = "processed amp"
+    else:
+        raise ValueError(f"Unsupported signal stage: {stage}")
+
+    time_s = (record.timestamps_ms.astype(np.float64) - float(record.timestamps_ms[0])) / 1000.0
+    gap_threshold_s = _estimate_gap_break_threshold_s(record.timestamps_ms)
+    if max_plot_samples > 0 and time_s.shape[0] > max_plot_samples:
+        stride = int(math.ceil(time_s.shape[0] / max_plot_samples))
+    else:
+        stride = 1
+
+    lead_names = ["CH20", *target_channels]
+    lead_signals = [input_signal, *[target_signals[idx] for idx in range(target_signals.shape[0])]]
+    num_rows = len(lead_names)
+    fig, axes = plt.subplots(num_rows, 1, figsize=(14, max(3.0, 2.2 * num_rows)), sharex=True, squeeze=False)
+    axes_array = axes.reshape(-1)
+
+    for row_idx, (lead_name, signal) in enumerate(zip(lead_names, lead_signals, strict=False)):
+        ax = axes_array[row_idx]
+        broken_time, broken_signals = _apply_gap_breaks(
+            time_s=time_s,
+            signals=[signal],
+            gap_threshold_s=gap_threshold_s,
+        )
+        ax.plot(broken_time[::stride], broken_signals[0][::stride], color="black", linewidth=1.0)
+        ax.grid(alpha=0.20)
+        ax.set_ylabel(f"{lead_name}\n{y_label}", fontsize=9)
+        if row_idx == num_rows - 1:
+            ax.set_xlabel("time (s)")
+
+    fig.suptitle(
+        (
+            f"{record.path.name} | {stage_label} signal view | "
+            f"original_fs={record.original_sampling_rate_hz:.1f} Hz -> "
+            f"eval_fs={record.sampling_rate_hz:.1f} Hz"
+        ),
+        fontsize=12,
+        y=1.01,
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _select_reconstructed_target_subset(
     reconstructed: np.ndarray,
     model_target_channels: list[str],
@@ -1707,6 +1775,11 @@ def main(argv: list[str] | None = None) -> int:
     plot_dir = ensure_dir(plot_dir_value) if plot_dir_value else output_dir / "plots"
     max_plot_samples = int(reconstruct_cfg.get("max_plot_samples", 4000))
     plot_dpi = int(reconstruct_cfg.get("plot_dpi", 150))
+    save_signal_stage_plots = bool(reconstruct_cfg.get("save_signal_stage_plots", False))
+    signal_stage_plot_dir_value = reconstruct_cfg.get("signal_stage_plot_dir")
+    signal_stage_plot_dir = (
+        ensure_dir(signal_stage_plot_dir_value) if signal_stage_plot_dir_value else output_dir / "signal_stage_plots"
+    )
     show_segment_metrics = bool(reconstruct_cfg.get("show_segment_metrics", False))
     save_focus_plots = bool(reconstruct_cfg.get("save_focus_plots", True))
     focus_plot_dir_value = reconstruct_cfg.get("focus_plot_dir")
@@ -1818,6 +1891,27 @@ def main(argv: list[str] | None = None) -> int:
         row["missing_target_channels"] = ",".join(
             channel for channel in model_target_channels if channel not in set(record_target_channels)
         )
+        if save_signal_stage_plots:
+            raw_signal_plot_path = signal_stage_plot_dir / "raw" / f"{record.path.stem}_raw.png"
+            processed_signal_plot_path = signal_stage_plot_dir / "processed" / f"{record.path.stem}_processed.png"
+            save_signal_stage_plot(
+                output_path=raw_signal_plot_path,
+                record=record,
+                target_channels=record_target_channels,
+                stage="raw",
+                max_plot_samples=max_plot_samples,
+                dpi=plot_dpi,
+            )
+            save_signal_stage_plot(
+                output_path=processed_signal_plot_path,
+                record=record,
+                target_channels=record_target_channels,
+                stage="processed",
+                max_plot_samples=max_plot_samples,
+                dpi=plot_dpi,
+            )
+            row["raw_signal_plot_path"] = str(raw_signal_plot_path)
+            row["processed_signal_plot_path"] = str(processed_signal_plot_path)
         if save_plots:
             plot_path = plot_dir / f"{record.path.stem}_comparison.png"
             save_reconstruction_comparison_plot(
@@ -1889,6 +1983,8 @@ def main(argv: list[str] | None = None) -> int:
         "rpeak_tolerance_ms",
         "available_target_channels",
         "missing_target_channels",
+        "raw_signal_plot_path",
+        "processed_signal_plot_path",
         "plot_path",
         "focus_lead",
         "focus_plot_path",
