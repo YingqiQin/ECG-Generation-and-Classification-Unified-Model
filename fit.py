@@ -149,6 +149,7 @@ def _build_dataset(split: str, data_cfg: dict) -> torch.utils.data.Dataset:
             csv_dirs=data_cfg.get("csv_dirs"),
             quality_preprocess_mode=data_cfg.get("quality_preprocess_mode", "none"),
             quality_preprocess_config=data_cfg,
+            allow_partial_target_channels=bool(data_cfg.get("allow_partial_target_channels", True)),
         )
 
     random_input = bool(data_cfg.get("random_input_lead", True))

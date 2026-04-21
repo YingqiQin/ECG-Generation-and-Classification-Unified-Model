@@ -26,6 +26,7 @@ class PreparedUpperArmRecord:
     timestamps_ms: np.ndarray
     input_signal: np.ndarray
     target_signals: np.ndarray
+    target_channel_names: tuple[str, ...]
     original_sampling_rate_hz: float
     sampling_rate_hz: float
 
@@ -396,19 +397,43 @@ def _build_timestamps_from_fs(length: int, sampling_rate_hz: float, start_time_m
     return start_time_ms + np.arange(length, dtype=np.float64) * (1000.0 / float(sampling_rate_hz))
 
 
+def _resolve_available_target_channels(
+    *,
+    requested_target_channels: list[str],
+    available_channel_names: Iterable[str],
+    allow_partial_target_channels: bool,
+    source_name: str,
+) -> list[str]:
+    available_set = {str(name) for name in available_channel_names}
+    available_targets = [channel for channel in requested_target_channels if channel in available_set]
+    missing_targets = [channel for channel in requested_target_channels if channel not in available_set]
+    if missing_targets and not allow_partial_target_channels:
+        raise ValueError(f"{source_name} is missing requested target channels: {missing_targets}")
+    if not available_targets:
+        raise ValueError(f"{source_name} does not contain any requested target channels: {requested_target_channels}")
+    return available_targets
+
+
 def _extract_npz_signal_map(
     npz_data: np.lib.npyio.NpzFile,
     input_channel: str,
     target_channels: list[str],
     signal_matrix_key: str | None,
     channel_names_key: str | None,
-) -> dict[str, np.ndarray]:
-    required_channels = [input_channel, *target_channels]
+    allow_partial_target_channels: bool,
+) -> tuple[dict[str, np.ndarray], list[str]]:
+    available_targets = _resolve_available_target_channels(
+        requested_target_channels=target_channels,
+        available_channel_names=npz_data.files,
+        allow_partial_target_channels=allow_partial_target_channels,
+        source_name="NPZ segment",
+    )
+    required_channels = [input_channel, *available_targets]
     if all(channel in npz_data.files for channel in required_channels):
         return {
             channel: np.asarray(npz_data[channel], dtype=np.float32).reshape(-1)
             for channel in required_channels
-        }
+        }, available_targets
 
     matrix_key = signal_matrix_key or ("signals" if "signals" in npz_data.files else None)
     names_key = channel_names_key or ("channel_names" if "channel_names" in npz_data.files else None)
@@ -432,14 +457,20 @@ def _extract_npz_signal_map(
         )
 
     index = {name: idx for idx, name in enumerate(channel_names)}
-    missing = [channel for channel in required_channels if channel not in index]
-    if missing:
-        raise ValueError(f"NPZ segment is missing requested channels: {missing}")
+    if input_channel not in index:
+        raise ValueError(f"NPZ segment is missing required input channel: {input_channel}")
+    available_targets = _resolve_available_target_channels(
+        requested_target_channels=target_channels,
+        available_channel_names=index,
+        allow_partial_target_channels=allow_partial_target_channels,
+        source_name="NPZ segment",
+    )
+    required_channels = [input_channel, *available_targets]
 
     return {
         channel: matrix[:, index[channel]].astype(np.float32, copy=False).reshape(-1)
         for channel in required_channels
-    }
+    }, available_targets
 
 
 def _load_npz_segment(
@@ -453,14 +484,16 @@ def _load_npz_segment(
     start_time_scale: float,
     signal_matrix_key: str | None,
     channel_names_key: str | None,
-) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    allow_partial_target_channels: bool,
+) -> tuple[np.ndarray, dict[str, np.ndarray], list[str]]:
     with np.load(path, allow_pickle=True) as npz_data:
-        signal_map = _extract_npz_signal_map(
+        signal_map, available_target_channels = _extract_npz_signal_map(
             npz_data=npz_data,
             input_channel=input_channel,
             target_channels=target_channels,
             signal_matrix_key=signal_matrix_key,
             channel_names_key=channel_names_key,
+            allow_partial_target_channels=allow_partial_target_channels,
         )
 
         if timestamp_key in npz_data.files:
@@ -485,7 +518,7 @@ def _load_npz_segment(
             raise ValueError(
                 f"{path.name} has inconsistent lengths: timestamps={expected_len}, {channel_name}={signal.shape[0]}"
             )
-    return timestamps_ms, signal_map
+    return timestamps_ms, signal_map, available_target_channels
 
 
 def _prepare_record_from_raw_signals(
@@ -535,6 +568,7 @@ def _prepare_record_from_raw_signals(
         timestamps_ms=timestamps_ms,
         input_signal=processed[input_channel],
         target_signals=np.stack([processed[channel] for channel in target_channels], axis=0),
+        target_channel_names=tuple(target_channels),
         original_sampling_rate_hz=original_sampling_rate_hz,
         sampling_rate_hz=sampling_rate_hz,
     )
@@ -548,20 +582,28 @@ def prepare_upperarm_record(
     normalize_mode: str,
     fallback_fs: float,
     target_fs: float | None = None,
+    allow_partial_target_channels: bool = True,
 ) -> PreparedUpperArmRecord:
     path = Path(path)
     target_channels_list = _as_channel_list(target_channels)
-    required_columns = ["timestamp_ms", input_channel, *target_channels_list]
 
     df = pd.read_csv(path)
+    required_columns = ["timestamp_ms", input_channel]
     missing = [column for column in required_columns if column not in df.columns]
     if missing:
         raise ValueError(f"{path.name} is missing required columns: {missing}")
+    available_target_channels = _resolve_available_target_channels(
+        requested_target_channels=target_channels_list,
+        available_channel_names=df.columns,
+        allow_partial_target_channels=allow_partial_target_channels,
+        source_name=path.name,
+    )
 
-    df = df[required_columns].copy()
-    for column in required_columns:
+    selected_columns = ["timestamp_ms", input_channel, *available_target_channels]
+    df = df[selected_columns].copy()
+    for column in selected_columns:
         df[column] = pd.to_numeric(df[column], errors="coerce")
-    df = df.dropna(subset=required_columns)
+    df = df.dropna(subset=selected_columns)
     if df.empty:
         raise ValueError(f"{path.name} has no valid rows after cleaning")
 
@@ -569,14 +611,14 @@ def prepare_upperarm_record(
     timestamps_ms = df["timestamp_ms"].to_numpy(dtype=np.float64)
     raw_signals = {
         channel: df[channel].to_numpy(dtype=np.float32)
-        for channel in [input_channel, *target_channels_list]
+        for channel in [input_channel, *available_target_channels]
     }
     return _prepare_record_from_raw_signals(
         path=path,
         timestamps_ms=timestamps_ms,
         raw_signals=raw_signals,
         input_channel=input_channel,
-        target_channels=target_channels_list,
+        target_channels=available_target_channels,
         apply_filter=apply_filter,
         normalize_mode=normalize_mode,
         fallback_fs=fallback_fs,
@@ -600,6 +642,7 @@ def prepare_upperarm_record_from_unit(
     npz_signal_matrix_key: str | None = None,
     npz_channel_names_key: str | None = None,
     quality_preprocess_mode: str = "none",
+    allow_partial_target_channels: bool = True,
 ) -> PreparedUpperArmRecord:
     target_channels_list = _as_channel_list(target_channels)
     preprocess_mode = _normalize_quality_preprocess_mode(quality_preprocess_mode)
@@ -624,13 +667,15 @@ def prepare_upperarm_record_from_unit(
             normalize_mode=normalize_mode,
             fallback_fs=fallback_fs,
             target_fs=target_fs,
+            allow_partial_target_channels=allow_partial_target_channels,
         )
     if effective_dataset_type != "upperarm_segmented_npz":
         raise ValueError(f"Unsupported dataset_type: {effective_dataset_type}")
 
     loaded_segments: list[tuple[np.ndarray, dict[str, np.ndarray]]] = []
+    resolved_target_channels: list[str] | None = None
     for source_path in unit.source_paths:
-        timestamps_ms, signal_map = _load_npz_segment(
+        timestamps_ms, signal_map, segment_target_channels = _load_npz_segment(
             path=source_path,
             input_channel=input_channel,
             target_channels=target_channels_list,
@@ -641,12 +686,22 @@ def prepare_upperarm_record_from_unit(
             start_time_scale=npz_start_time_scale,
             signal_matrix_key=npz_signal_matrix_key,
             channel_names_key=npz_channel_names_key,
+            allow_partial_target_channels=allow_partial_target_channels,
         )
+        if resolved_target_channels is None:
+            resolved_target_channels = list(segment_target_channels)
+        elif list(segment_target_channels) != resolved_target_channels:
+            raise ValueError(
+                f"{unit.path.name} has inconsistent target channels across NPZ segments: "
+                f"{resolved_target_channels} vs {list(segment_target_channels)}"
+            )
         loaded_segments.append((timestamps_ms, signal_map))
+    if resolved_target_channels is None:
+        raise ValueError(f"{unit.path.name} has no usable target channels")
 
     original_timestamp_parts = [timestamps_ms for timestamps_ms, _ in loaded_segments]
     original_signal_parts: dict[str, list[np.ndarray]] = {
-        channel: [] for channel in [input_channel, *target_channels_list]
+        channel: [] for channel in [input_channel, *resolved_target_channels]
     }
     for timestamps_ms, signal_map in loaded_segments:
         for channel in original_signal_parts:
@@ -669,7 +724,7 @@ def prepare_upperarm_record_from_unit(
 
     timestamp_parts: list[np.ndarray] = []
     signal_parts: dict[str, list[np.ndarray]] = {
-        channel: [] for channel in [input_channel, *target_channels_list]
+        channel: [] for channel in [input_channel, *resolved_target_channels]
     }
     if target_fs is not None and target_fs > 0:
         # Resample each kept segment independently so rejected intervals remain real gaps.
@@ -711,7 +766,7 @@ def prepare_upperarm_record_from_unit(
         timestamps_ms=timestamps_ms,
         raw_signals=raw_signals,
         input_channel=input_channel,
-        target_channels=target_channels_list,
+        target_channels=resolved_target_channels,
         apply_filter=apply_filter,
         normalize_mode=normalize_mode,
         fallback_fs=fallback_fs,
@@ -749,6 +804,7 @@ def load_upperarm_records(
     csv_dirs: Iterable[str | Path] | str | Path | None = None,
     quality_preprocess_mode: str = "none",
     quality_preprocess_config: dict[str, Any] | None = None,
+    allow_partial_target_channels: bool = True,
 ) -> list[PreparedUpperArmRecord]:
     roots = csv_dirs or csv_dir
     units = discover_upperarm_source_units_from_dirs(
@@ -792,6 +848,7 @@ def load_upperarm_records(
             npz_signal_matrix_key=npz_signal_matrix_key,
             npz_channel_names_key=npz_channel_names_key,
             quality_preprocess_mode=quality_preprocess_mode,
+            allow_partial_target_channels=allow_partial_target_channels,
         )
         for unit in units
     ]
@@ -831,6 +888,7 @@ class UpperArmCSVWindowsDataset(Dataset):
         csv_dirs: Iterable[str | Path] | str | Path | None = None,
         quality_preprocess_mode: str = "none",
         quality_preprocess_config: dict[str, Any] | None = None,
+        allow_partial_target_channels: bool = True,
     ) -> None:
         self.segment_length = int(segment_length)
         self.segment_stride = int(segment_stride)
@@ -866,7 +924,17 @@ class UpperArmCSVWindowsDataset(Dataset):
             csv_dirs=csv_dirs,
             quality_preprocess_mode=quality_preprocess_mode,
             quality_preprocess_config=quality_preprocess_config,
+            allow_partial_target_channels=allow_partial_target_channels,
         )
+        if self.records:
+            resolved_target_channels = list(self.records[0].target_channel_names)
+            for record in self.records[1:]:
+                if list(record.target_channel_names) != resolved_target_channels:
+                    raise RuntimeError(
+                        "Upper-arm dataset contains inconsistent available target channels across records: "
+                        f"{resolved_target_channels} vs {list(record.target_channel_names)}"
+                    )
+            self.target_channels = resolved_target_channels
 
         self.items: list[tuple[int, int]] = []
         for record_idx, record in enumerate(self.records):

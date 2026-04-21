@@ -234,6 +234,7 @@ def _save_segmented_reconstruction_comparison_plot(
     segment_slices: list[slice],
     max_plot_samples: int,
     dpi: int,
+    show_segment_metrics: bool = False,
     max_segments_per_figure: int = 6,
 ) -> None:
     import matplotlib
@@ -303,6 +304,25 @@ def _save_segmented_reconstruction_comparison_plot(
                         label="lag-corrected recon",
                     )
                 ax.grid(alpha=0.20)
+                if show_segment_metrics:
+                    metric_text = _segment_metric_text(
+                        target=target_display[segment_slice],
+                        pred=pred_display[segment_slice],
+                        sampling_rate_hz=float(record.sampling_rate_hz),
+                        corr_method=corr_method,
+                        lag_metrics_enabled=lag_metrics_enabled,
+                        max_lag_ms=float(metrics_row.get("lag_search_window_ms", 150.0)),
+                    )
+                    ax.text(
+                        0.02,
+                        0.98,
+                        metric_text,
+                        transform=ax.transAxes,
+                        va="top",
+                        ha="left",
+                        fontsize=7.5,
+                        bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.72, "pad": 2.0},
+                    )
                 if col_idx == 0:
                     ax.set_ylabel(f"{lead_name}\namp", fontsize=9)
                 if row_idx == num_rows - 1:
@@ -362,6 +382,7 @@ def _save_segmented_focus_lead_plot(
     half_window_samples: int,
     max_plot_samples: int,
     dpi: int,
+    show_segment_metrics: bool = False,
     max_segments_per_figure: int = 4,
 ) -> None:
     import matplotlib
@@ -442,6 +463,25 @@ def _save_segmented_focus_lead_plot(
                 f"seg {segment_number}\n{absolute_start_s:.1f}-{absolute_end_s:.1f}s",
                 fontsize=10,
             )
+            if show_segment_metrics:
+                metric_text = _segment_metric_text(
+                    target=segment_target,
+                    pred=segment_pred,
+                    sampling_rate_hz=float(record.sampling_rate_hz),
+                    corr_method=corr_method,
+                    lag_metrics_enabled=lag_metrics_enabled,
+                    max_lag_ms=float(metrics_row.get("lag_search_window_ms", 150.0)),
+                )
+                overview_ax.text(
+                    0.02,
+                    0.98,
+                    metric_text,
+                    transform=overview_ax.transAxes,
+                    va="top",
+                    ha="left",
+                    fontsize=8.0,
+                    bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.72, "pad": 2.0},
+                )
             if col_idx == 0:
                 overview_ax.set_ylabel(f"{lead_name}\namp")
 
@@ -531,6 +571,37 @@ def _bounded_xcorr_metrics(
     }
 
 
+def _segment_metric_text(
+    target: np.ndarray,
+    pred: np.ndarray,
+    sampling_rate_hz: float,
+    corr_method: str,
+    lag_metrics_enabled: bool,
+    max_lag_ms: float,
+) -> str:
+    target = np.asarray(target, dtype=np.float32).reshape(-1)
+    pred = np.asarray(pred, dtype=np.float32).reshape(-1)
+    if target.size == 0 or pred.size == 0:
+        return f"{corr_method}=nan"
+    usable = min(target.size, pred.size)
+    target = target[:usable]
+    pred = pred[:usable]
+    corr_value = _corr(pred, target, method=corr_method)
+    metric_text = f"{corr_method}={corr_value:.3f}"
+    if lag_metrics_enabled and usable >= 8:
+        lag_metrics = _bounded_xcorr_metrics(
+            target=target,
+            pred=pred,
+            sampling_rate_hz=float(sampling_rate_hz),
+            corr_method=corr_method,
+            max_lag_ms=float(max_lag_ms),
+        )
+        lag_corr = float(lag_metrics.get(f"lag_corrected_{corr_method}", float("nan")))
+        lag_ms = float(lag_metrics.get("best_lag_ms", float("nan")))
+        metric_text += f"\nlag={lag_ms:.1f}ms | lag-{corr_method}={lag_corr:.3f}"
+    return metric_text
+
+
 def _downsample_for_dtw(signal: np.ndarray, max_points: int) -> np.ndarray:
     if max_points <= 0 or signal.size <= max_points:
         return signal.astype(np.float32, copy=False)
@@ -608,6 +679,19 @@ def _write_reconstruction_csv(
             writer.writerow(
                 [timestamp_cell, *[float(reconstructed[channel_idx, idx]) for channel_idx in range(reconstructed.shape[0])]]
             )
+
+
+def _select_reconstructed_target_subset(
+    reconstructed: np.ndarray,
+    model_target_channels: list[str],
+    record_target_channels: list[str],
+) -> np.ndarray:
+    channel_to_index = {name: idx for idx, name in enumerate(model_target_channels)}
+    missing = [name for name in record_target_channels if name not in channel_to_index]
+    if missing:
+        raise ValueError(f"Reconstructed output is missing requested target channels: {missing}")
+    indices = [channel_to_index[name] for name in record_target_channels]
+    return reconstructed[indices]
 
 
 def _append_metrics(path: Path, rows: list[dict[str, object]], fieldnames: list[str]) -> None:
@@ -1146,6 +1230,7 @@ def save_reconstruction_comparison_plot(
     visual_filter_mode: str = "recon_only",
     max_plot_samples: int = 4000,
     dpi: int = 150,
+    show_segment_metrics: bool = False,
 ) -> None:
     import matplotlib
 
@@ -1191,6 +1276,7 @@ def save_reconstruction_comparison_plot(
             segment_slices=segment_slices,
             max_plot_samples=max_plot_samples,
             dpi=dpi,
+            show_segment_metrics=show_segment_metrics,
         )
         return
 
@@ -1266,6 +1352,7 @@ def save_focus_lead_plot(
     window_ms: float = 900.0,
     max_plot_samples: int = 4000,
     dpi: int = 180,
+    show_segment_metrics: bool = False,
 ) -> tuple[str, int]:
     import matplotlib
 
@@ -1310,6 +1397,7 @@ def save_focus_lead_plot(
             half_window_samples=half_window_samples,
             max_plot_samples=max_plot_samples,
             dpi=dpi,
+            show_segment_metrics=show_segment_metrics,
         )
         return lead_name, lead_idx
 
@@ -1619,6 +1707,7 @@ def main(argv: list[str] | None = None) -> int:
     plot_dir = ensure_dir(plot_dir_value) if plot_dir_value else output_dir / "plots"
     max_plot_samples = int(reconstruct_cfg.get("max_plot_samples", 4000))
     plot_dpi = int(reconstruct_cfg.get("plot_dpi", 150))
+    show_segment_metrics = bool(reconstruct_cfg.get("show_segment_metrics", False))
     save_focus_plots = bool(reconstruct_cfg.get("save_focus_plots", True))
     focus_plot_dir_value = reconstruct_cfg.get("focus_plot_dir")
     focus_plot_dir = ensure_dir(focus_plot_dir_value) if focus_plot_dir_value else output_dir / "focus_plots"
@@ -1640,12 +1729,12 @@ def main(argv: list[str] | None = None) -> int:
     dtw_max_points = int(reconstruct_cfg.get("dtw_max_points", 2000))
     rpeak_tolerance_ms = float(reconstruct_cfg.get("rpeak_tolerance_ms", 120.0))
 
-    target_channels = list(data_cfg.get("target_channels") or [f"CH{i}" for i in range(1, 9)])
+    model_target_channels = list(data_cfg.get("target_channels") or [f"CH{i}" for i in range(1, 9)])
     records = load_upperarm_records(
         csv_dir=data_cfg["csv_dir"],
         file_glob=data_cfg.get("file_glob", "emg_data_*.csv"),
         input_channel=data_cfg.get("input_channel", "CH20"),
-        target_channels=target_channels,
+        target_channels=model_target_channels,
         apply_filter=bool(data_cfg.get("apply_filter", True)),
         normalize_mode=data_cfg.get("normalize_mode", "zscore"),
         fallback_fs=float(data_cfg.get("fallback_fs", 250.0)),
@@ -1669,9 +1758,10 @@ def main(argv: list[str] | None = None) -> int:
         csv_dirs=data_cfg.get("csv_dirs"),
         quality_preprocess_mode=data_cfg.get("quality_preprocess_mode", "none"),
         quality_preprocess_config=data_cfg,
+        allow_partial_target_channels=bool(data_cfg.get("allow_partial_target_channels", True)),
     )
 
-    model = build_upperarm_model(model_cfg=model_cfg, target_channels=target_channels, device=device)
+    model = build_upperarm_model(model_cfg=model_cfg, target_channels=model_target_channels, device=device)
     load_report = load_shape_matched_checkpoint(model, ckpt_path=ckpt_path, device=device)
     if load_report["missing_keys"]:
         print("Warning: missing keys:", load_report["missing_keys"])
@@ -1704,31 +1794,42 @@ def main(argv: list[str] | None = None) -> int:
         _write_reconstruction_csv(
             output_path=output_path,
             timestamps_ms=record.timestamps_ms,
-            target_channels=target_channels,
+            target_channels=model_target_channels,
             reconstructed=y_hat_full,
+        )
+        record_target_channels = list(record.target_channel_names)
+        reconstructed_eval = _select_reconstructed_target_subset(
+            reconstructed=y_hat_full,
+            model_target_channels=model_target_channels,
+            record_target_channels=record_target_channels,
         )
 
         row = build_reconstruction_metrics_row(
             record=record,
-            target_channels=target_channels,
-            reconstructed=y_hat_full,
+            target_channels=record_target_channels,
+            reconstructed=reconstructed_eval,
             corr_method=corr_method,
             enable_lag_metrics=enable_lag_metrics,
             lag_search_window_ms=lag_search_window_ms,
             dtw_max_points=dtw_max_points,
             rpeak_tolerance_ms=rpeak_tolerance_ms,
         )
+        row["available_target_channels"] = ",".join(record_target_channels)
+        row["missing_target_channels"] = ",".join(
+            channel for channel in model_target_channels if channel not in set(record_target_channels)
+        )
         if save_plots:
             plot_path = plot_dir / f"{record.path.stem}_comparison.png"
             save_reconstruction_comparison_plot(
                 output_path=plot_path,
                 record=record,
-                target_channels=target_channels,
-                reconstructed=y_hat_full,
+                target_channels=record_target_channels,
+                reconstructed=reconstructed_eval,
                 metrics_row=row,
                 visual_filter_mode=visual_filter_mode,
                 max_plot_samples=max_plot_samples,
                 dpi=plot_dpi,
+                show_segment_metrics=show_segment_metrics,
             )
             row["plot_path"] = str(plot_path)
         if save_focus_plots:
@@ -1736,8 +1837,8 @@ def main(argv: list[str] | None = None) -> int:
             selected_focus_lead, _ = save_focus_lead_plot(
                 output_path=focus_plot_path,
                 record=record,
-                target_channels=target_channels,
-                reconstructed=y_hat_full,
+                target_channels=record_target_channels,
+                reconstructed=reconstructed_eval,
                 metrics_row=row,
                 focus_lead=focus_lead,
                 visual_filter_mode=visual_filter_mode,
@@ -1745,6 +1846,7 @@ def main(argv: list[str] | None = None) -> int:
                 window_ms=focus_window_ms,
                 max_plot_samples=max_plot_samples,
                 dpi=focus_plot_dpi,
+                show_segment_metrics=show_segment_metrics,
             )
             row["focus_lead"] = selected_focus_lead
             row["focus_plot_path"] = str(focus_plot_path)
@@ -1754,8 +1856,8 @@ def main(argv: list[str] | None = None) -> int:
                 output_path=latent_plot_path,
                 model=model,
                 record=record,
-                target_channels=target_channels,
-                reconstructed=y_hat_full,
+                target_channels=record_target_channels,
+                reconstructed=reconstructed_eval,
                 segment_length=segment_length,
                 segment_stride=segment_stride,
                 segment_policy=segment_policy,
@@ -1785,6 +1887,8 @@ def main(argv: list[str] | None = None) -> int:
         "lag_metrics_enabled",
         "lag_search_window_ms",
         "rpeak_tolerance_ms",
+        "available_target_channels",
+        "missing_target_channels",
         "plot_path",
         "focus_lead",
         "focus_plot_path",
@@ -1802,7 +1906,7 @@ def main(argv: list[str] | None = None) -> int:
         "mean_lag_corrected_rpeak_timing_mae_ms",
         "mean_lag_corrected_rpeak_match_fraction",
     ]
-    for lead_name in target_channels:
+    for lead_name in model_target_channels:
         fieldnames.extend(
             [
                 f"{lead_name}_mse",

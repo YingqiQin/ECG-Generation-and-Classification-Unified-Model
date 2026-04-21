@@ -17,6 +17,7 @@ from mcma_torch.data.upperarm_csv import (
     prepare_upperarm_record_from_unit,
 )
 from mcma_torch.eval.reconstruct_upperarm import (
+    _select_reconstructed_target_subset,
     build_reconstruction_metrics_row,
     build_upperarm_model,
     reconstruct_record,
@@ -174,6 +175,8 @@ def _build_fieldnames(target_channels: list[str], corr_method: str) -> list[str]
         "lag_metrics_enabled",
         "lag_search_window_ms",
         "rpeak_tolerance_ms",
+        "available_target_channels",
+        "missing_target_channels",
         "plot_path",
         "focus_lead",
         "focus_plot_path",
@@ -246,9 +249,9 @@ def _evaluate_checkpoint_on_files(
     dataset_type = str(data_cfg.get("dataset_type", "upperarm_csv"))
     device_name = reconstruct_cfg.get("device", trainer_cfg.get("device", "cuda"))
     device = torch.device(device_name if torch.cuda.is_available() else "cpu")
-    target_channels = list(data_cfg.get("target_channels") or [f"CH{i}" for i in range(1, 9)])
+    model_target_channels = list(data_cfg.get("target_channels") or [f"CH{i}" for i in range(1, 9)])
 
-    model = build_upperarm_model(model_cfg=model_cfg, target_channels=target_channels, device=device)
+    model = build_upperarm_model(model_cfg=model_cfg, target_channels=model_target_channels, device=device)
     load_report = load_shape_matched_checkpoint(model, ckpt_path=ckpt_path, device=device)
     model.eval()
 
@@ -262,6 +265,7 @@ def _evaluate_checkpoint_on_files(
     rpeak_tolerance_ms = float(reconstruct_cfg.get("rpeak_tolerance_ms", 120.0))
     visual_filter_mode = str(reconstruct_cfg.get("visual_filter_mode", "recon_only"))
     enable_lag_metrics = bool(reconstruct_cfg.get("enable_lag_metrics", True))
+    show_segment_metrics = bool(reconstruct_cfg.get("show_segment_metrics", False))
 
     rows: list[dict[str, object]] = []
     for unit in files:
@@ -269,7 +273,7 @@ def _evaluate_checkpoint_on_files(
             unit=unit,
             dataset_type=dataset_type,
             input_channel=data_cfg.get("input_channel", "CH20"),
-            target_channels=target_channels,
+            target_channels=model_target_channels,
             apply_filter=bool(data_cfg.get("apply_filter", True)),
             normalize_mode=data_cfg.get("normalize_mode", "zscore"),
             fallback_fs=float(data_cfg.get("fallback_fs", 250.0)),
@@ -281,6 +285,7 @@ def _evaluate_checkpoint_on_files(
             npz_signal_matrix_key=data_cfg.get("npz_signal_matrix_key"),
             npz_channel_names_key=data_cfg.get("npz_channel_names_key"),
             quality_preprocess_mode=data_cfg.get("quality_preprocess_mode", "none"),
+            allow_partial_target_channels=bool(data_cfg.get("allow_partial_target_channels", True)),
         )
         reconstructed = reconstruct_record(
             model=model,
@@ -292,27 +297,38 @@ def _evaluate_checkpoint_on_files(
             batch_size=batch_size,
             device=device,
         )
+        record_target_channels = list(record.target_channel_names)
+        reconstructed_eval = _select_reconstructed_target_subset(
+            reconstructed=reconstructed,
+            model_target_channels=model_target_channels,
+            record_target_channels=record_target_channels,
+        )
         row = build_reconstruction_metrics_row(
             record=record,
-            target_channels=target_channels,
-            reconstructed=reconstructed,
+            target_channels=record_target_channels,
+            reconstructed=reconstructed_eval,
             corr_method=corr_method,
             enable_lag_metrics=enable_lag_metrics,
             lag_search_window_ms=lag_search_window_ms,
             dtw_max_points=dtw_max_points,
             rpeak_tolerance_ms=rpeak_tolerance_ms,
         )
+        row["available_target_channels"] = ",".join(record_target_channels)
+        row["missing_target_channels"] = ",".join(
+            channel for channel in model_target_channels if channel not in set(record_target_channels)
+        )
         if plot_dir is not None:
             plot_path = plot_dir / f"{unit.path.stem}_comparison.png"
             save_reconstruction_comparison_plot(
                 output_path=plot_path,
                 record=record,
-                target_channels=target_channels,
-                reconstructed=reconstructed,
+                target_channels=record_target_channels,
+                reconstructed=reconstructed_eval,
                 metrics_row=row,
                 visual_filter_mode=visual_filter_mode,
                 max_plot_samples=max_plot_samples,
                 dpi=plot_dpi,
+                show_segment_metrics=show_segment_metrics,
             )
             row["plot_path"] = str(plot_path)
         if focus_plot_dir is not None:
@@ -320,8 +336,8 @@ def _evaluate_checkpoint_on_files(
             selected_focus_lead, _ = save_focus_lead_plot(
                 output_path=focus_plot_path,
                 record=record,
-                target_channels=target_channels,
-                reconstructed=reconstructed,
+                target_channels=record_target_channels,
+                reconstructed=reconstructed_eval,
                 metrics_row=row,
                 focus_lead=focus_lead,
                 visual_filter_mode=visual_filter_mode,
@@ -329,6 +345,7 @@ def _evaluate_checkpoint_on_files(
                 window_ms=focus_window_ms,
                 max_plot_samples=max_plot_samples,
                 dpi=focus_plot_dpi,
+                show_segment_metrics=show_segment_metrics,
             )
             row["focus_lead"] = selected_focus_lead
             row["focus_plot_path"] = str(focus_plot_path)
@@ -338,8 +355,8 @@ def _evaluate_checkpoint_on_files(
                 output_path=latent_plot_path,
                 model=model,
                 record=record,
-                target_channels=target_channels,
-                reconstructed=reconstructed,
+                target_channels=record_target_channels,
+                reconstructed=reconstructed_eval,
                 segment_length=segment_length,
                 segment_stride=segment_stride,
                 segment_policy=segment_policy,
