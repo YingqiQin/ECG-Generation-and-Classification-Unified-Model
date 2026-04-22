@@ -66,6 +66,36 @@ def _parse_value(raw: str) -> Any:
         return raw
 
 
+LEAD_DISPLAY_NAMES = {
+    "CH1": "Lead I",
+    "CH2": "Lead II",
+    "CH3": "V1",
+    "CH4": "V2",
+    "CH5": "V3",
+    "CH6": "V4",
+    "CH7": "V5",
+    "CH8": "V6",
+}
+
+
+def _display_lead_name(lead_name: str) -> str:
+    mapped = LEAD_DISPLAY_NAMES.get(str(lead_name).strip().upper())
+    if mapped is None:
+        return str(lead_name)
+    return f"{lead_name} ({mapped})"
+
+
+def _as_focus_lead_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value).strip()
+    return [text] if text else []
+
+
 def _set_nested(config: dict, keys: list[str], value: Any) -> None:
     cursor = config
     for key in keys[:-1]:
@@ -394,6 +424,7 @@ def _save_segmented_focus_lead_plot(
     segment_slices = _segment_slices_from_timestamps(record.timestamps_ms, gap_threshold_s=gap_threshold_s)
     if not segment_slices:
         return
+    lead_display_name = _display_lead_name(lead_name)
 
     page_size = max(1, int(max_segments_per_figure))
     pages = [
@@ -483,7 +514,7 @@ def _save_segmented_focus_lead_plot(
                     bbox={"facecolor": "white", "edgecolor": "none", "alpha": 0.72, "pad": 2.0},
                 )
             if col_idx == 0:
-                overview_ax.set_ylabel(f"{lead_name}\namp")
+                overview_ax.set_ylabel(f"{lead_display_name}\namp")
 
             zoom_ax = axes[1, col_idx]
             zoom_time_ms = (segment_time_s[left:right] - segment_time_s[center_local]) * 1000.0
@@ -509,7 +540,7 @@ def _save_segmented_focus_lead_plot(
         if handles:
             fig.legend(handles, labels, loc="upper right")
         title = (
-            f"{record.path.name} | focus_lead={lead_name} | segmented focus | "
+            f"{record.path.name} | focus_lead={lead_display_name} | segmented focus | "
             f"raw {corr_method}={float(metrics_row[f'{lead_name}_{corr_method}']):.3f}"
         )
         if lag_metrics_enabled:
@@ -734,7 +765,7 @@ def save_signal_stage_plot(
                 linewidth=1.0 if lead_name != "CH20" else 1.2,
                 color=color,
                 alpha=0.90 if lead_name == "CH20" else 0.82,
-                label=lead_name,
+                label=_display_lead_name(lead_name),
             )
         ax.grid(alpha=0.20)
         ax.set_ylabel(y_label, fontsize=10)
@@ -1119,7 +1150,7 @@ def save_latent_space_plot(
         reference_ax.scatter(points[:, 0], points[:, 1], s=15, c=[color], alpha=0.30, marker="o", edgecolors="none")
         centroid = centroid_proj[target_key]
         reference_ax.scatter(centroid[0], centroid[1], s=60, c=[color], marker="o", edgecolors="white", linewidths=0.5)
-        reference_ax.annotate(lead_name, (centroid[0], centroid[1]), textcoords="offset points", xytext=(4, 4), fontsize=8, color=color)
+        reference_ax.annotate(_display_lead_name(lead_name), (centroid[0], centroid[1]), textcoords="offset points", xytext=(4, 4), fontsize=8, color=color)
 
     for lead_name in target_channels:
         target_key = ("target", lead_name)
@@ -1197,7 +1228,7 @@ def save_latent_space_plot(
             alpha=0.90,
         )
         upperarm_ax.annotate(
-            f"nearest target: {best_upperarm_lead}\nlatent l2={best_upperarm_distance:.3f}",
+            f"nearest target: {_display_lead_name(best_upperarm_lead)}\nlatent l2={best_upperarm_distance:.3f}",
             (upperarm_point[0], upperarm_point[1]),
             textcoords="offset points",
             xytext=(10, -30),
@@ -1219,7 +1250,7 @@ def save_latent_space_plot(
         Line2D([0], [0], marker="X", color="black", linestyle="none", markersize=8, label="upper-arm windows"),
         Line2D([0], [0], marker="^", markerfacecolor="white", markeredgecolor="black", linestyle="none", markersize=8, label="reconstructed windows"),
     ]
-    lead_handles = [Line2D([0], [0], marker="o", color=lead_colors[lead_name], linestyle="none", markersize=7, label=lead_name) for lead_name in target_channels]
+    lead_handles = [Line2D([0], [0], marker="o", color=lead_colors[lead_name], linestyle="none", markersize=7, label=_display_lead_name(lead_name)) for lead_name in target_channels]
     recon_ax.legend(handles=family_handles, loc="upper right", fontsize=8, frameon=True)
     fig.legend(handles=lead_handles, loc="lower center", ncol=min(4, len(target_channels)), fontsize=8, frameon=False, bbox_to_anchor=(0.5, -0.02))
 
@@ -1370,6 +1401,7 @@ def save_reconstruction_comparison_plot(
 
     for lead_idx, (lead_name, target_display, pred_display, pred_shifted, target_label, pred_label) in enumerate(lead_series):
         ax = axes_array[lead_idx]
+        lead_display_name = _display_lead_name(lead_name)
         gap_broken_time, gap_broken_signals = _apply_gap_breaks(
             time_s=time_s,
             signals=[target_display, pred_display, pred_shifted if pred_shifted is not None else pred_display],
@@ -1391,19 +1423,19 @@ def save_reconstruction_comparison_plot(
             lag_rmse_value = float(metrics_row.get(f"{lead_name}_lag_corrected_rmse", float("nan")))
             if show_rmse_in_titles:
                 title = (
-                    f"{lead_name} | raw {corr_method}={corr_value:.3f} | lag {lag_ms_value:.1f} ms | "
+                    f"{lead_display_name} | raw {corr_method}={corr_value:.3f} | lag {lag_ms_value:.1f} ms | "
                     f"lag-{corr_method}={lag_corr_value:.3f} | raw/lag-rmse={rmse_value:.3f}/{lag_rmse_value:.3f}"
                 )
             else:
                 title = (
-                    f"{lead_name} | raw {corr_method}={corr_value:.3f} | lag {lag_ms_value:.1f} ms | "
+                    f"{lead_display_name} | raw {corr_method}={corr_value:.3f} | lag {lag_ms_value:.1f} ms | "
                     f"lag-{corr_method}={lag_corr_value:.3f}"
                 )
         else:
             title = (
-                f"{lead_name} | {corr_method}={corr_value:.3f} | rmse={rmse_value:.3f}"
+                f"{lead_display_name} | {corr_method}={corr_value:.3f} | rmse={rmse_value:.3f}"
                 if show_rmse_in_titles
-                else f"{lead_name} | {corr_method}={corr_value:.3f}"
+                else f"{lead_display_name} | {corr_method}={corr_value:.3f}"
             )
         ax.set_title(title, fontsize=10)
         ax.grid(alpha=0.2)
@@ -1467,6 +1499,7 @@ def save_focus_lead_plot(
         corr_method=corr_method,
         requested_lead=focus_lead,
     )
+    lead_display_name = _display_lead_name(lead_name)
 
     time_s = (record.timestamps_ms.astype(np.float64) - float(record.timestamps_ms[0])) / 1000.0
     gap_threshold_s = _estimate_gap_break_threshold_s(record.timestamps_ms)
@@ -1542,18 +1575,18 @@ def save_focus_lead_plot(
     overview_ax.grid(alpha=0.2)
     if lag_metrics_enabled:
         overview_title = (
-            f"{lead_name} full trace | raw {corr_method}={float(metrics_row[f'{lead_name}_{corr_method}']):.3f} | "
+            f"{lead_display_name} full trace | raw {corr_method}={float(metrics_row[f'{lead_name}_{corr_method}']):.3f} | "
             f"lag={float(metrics_row[f'{lead_name}_best_lag_ms']):.1f} ms | "
             f"lag-{corr_method}={float(metrics_row[f'{lead_name}_lag_corrected_{corr_method}']):.3f} | "
             f"rpeak-mae={float(metrics_row[f'{lead_name}_lag_corrected_rpeak_timing_mae_ms']):.1f} ms"
         )
     else:
         overview_title = (
-            f"{lead_name} full trace | {corr_method}={float(metrics_row[f'{lead_name}_{corr_method}']):.3f} | "
+            f"{lead_display_name} full trace | {corr_method}={float(metrics_row[f'{lead_name}_{corr_method}']):.3f} | "
             f"rmse={float(metrics_row[f'{lead_name}_rmse']):.3f}"
         )
         if not show_rmse_in_titles:
-            overview_title = f"{lead_name} full trace | {corr_method}={float(metrics_row[f'{lead_name}_{corr_method}']):.3f}"
+            overview_title = f"{lead_display_name} full trace | {corr_method}={float(metrics_row[f'{lead_name}_{corr_method}']):.3f}"
     overview_ax.set_title(overview_title, fontsize=11)
 
     if centers.shape[0] == 0:
@@ -1584,7 +1617,7 @@ def save_focus_lead_plot(
     fig.legend(handles, labels, loc="upper right")
     fig.suptitle(
         (
-            f"{record.path.name} | focus_lead={lead_name} | original_fs={record.original_sampling_rate_hz:.1f} Hz "
+            f"{record.path.name} | focus_lead={lead_display_name} | original_fs={record.original_sampling_rate_hz:.1f} Hz "
             f"-> eval_fs={record.sampling_rate_hz:.1f} Hz | beat-level zoom"
         ),
         fontsize=12,
@@ -1595,6 +1628,64 @@ def save_focus_lead_plot(
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
     plt.close(fig)
     return lead_name, lead_idx
+
+
+def save_focus_lead_plots(
+    output_path: Path,
+    record: PreparedUpperArmRecord,
+    target_channels: list[str],
+    reconstructed: np.ndarray,
+    metrics_row: dict[str, object],
+    focus_leads: Any = None,
+    visual_filter_mode: str = "recon_only",
+    num_beats: int = 4,
+    window_ms: float = 900.0,
+    max_plot_samples: int = 4000,
+    dpi: int = 180,
+    show_segment_metrics: bool = False,
+    show_rmse_in_titles: bool = True,
+) -> tuple[list[str], list[str]]:
+    requested_focus_leads = _as_focus_lead_list(focus_leads)
+    if not requested_focus_leads:
+        selected_focus_lead, _ = save_focus_lead_plot(
+            output_path=output_path,
+            record=record,
+            target_channels=target_channels,
+            reconstructed=reconstructed,
+            metrics_row=metrics_row,
+            focus_lead=None,
+            visual_filter_mode=visual_filter_mode,
+            num_beats=num_beats,
+            window_ms=window_ms,
+            max_plot_samples=max_plot_samples,
+            dpi=dpi,
+            show_segment_metrics=show_segment_metrics,
+            show_rmse_in_titles=show_rmse_in_titles,
+        )
+        return [selected_focus_lead], [str(output_path)]
+
+    selected_focus_leads: list[str] = []
+    output_paths: list[str] = []
+    for requested_lead in requested_focus_leads:
+        lead_output_path = output_path.with_name(f"{output_path.stem}_{requested_lead}{output_path.suffix}")
+        selected_focus_lead, _ = save_focus_lead_plot(
+            output_path=lead_output_path,
+            record=record,
+            target_channels=target_channels,
+            reconstructed=reconstructed,
+            metrics_row=metrics_row,
+            focus_lead=requested_lead,
+            visual_filter_mode=visual_filter_mode,
+            num_beats=num_beats,
+            window_ms=window_ms,
+            max_plot_samples=max_plot_samples,
+            dpi=dpi,
+            show_segment_metrics=show_segment_metrics,
+            show_rmse_in_titles=show_rmse_in_titles,
+        )
+        selected_focus_leads.append(selected_focus_lead)
+        output_paths.append(str(lead_output_path))
+    return selected_focus_leads, output_paths
 
 
 def build_upperarm_model(
@@ -1964,13 +2055,13 @@ def main(argv: list[str] | None = None) -> int:
             row["plot_path"] = str(plot_path)
         if save_focus_plots:
             focus_plot_path = focus_plot_dir / f"{record.path.stem}_focus.png"
-            selected_focus_lead, _ = save_focus_lead_plot(
+            selected_focus_leads, focus_plot_paths = save_focus_lead_plots(
                 output_path=focus_plot_path,
                 record=record,
                 target_channels=record_target_channels,
                 reconstructed=reconstructed_eval,
                 metrics_row=row,
-                focus_lead=focus_lead,
+                focus_leads=focus_lead,
                 visual_filter_mode=visual_filter_mode,
                 num_beats=focus_num_beats,
                 window_ms=focus_window_ms,
@@ -1979,8 +2070,8 @@ def main(argv: list[str] | None = None) -> int:
                 show_segment_metrics=show_segment_metrics,
                 show_rmse_in_titles=show_rmse_in_titles,
             )
-            row["focus_lead"] = selected_focus_lead
-            row["focus_plot_path"] = str(focus_plot_path)
+            row["focus_lead"] = ",".join(selected_focus_leads)
+            row["focus_plot_path"] = ";".join(focus_plot_paths)
         if save_latent_plots:
             latent_plot_path = latent_plot_dir / f"{record.path.stem}_latent.png"
             save_latent_space_plot(

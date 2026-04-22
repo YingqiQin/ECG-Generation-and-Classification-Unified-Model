@@ -21,7 +21,7 @@ from mcma_torch.eval.reconstruct_upperarm import (
     build_reconstruction_metrics_row,
     build_upperarm_model,
     reconstruct_record,
-    save_focus_lead_plot,
+    save_focus_lead_plots,
     save_latent_space_plot,
     save_reconstruction_comparison_plot,
 )
@@ -335,13 +335,13 @@ def _evaluate_checkpoint_on_files(
             row["plot_path"] = str(plot_path)
         if focus_plot_dir is not None:
             focus_plot_path = focus_plot_dir / f"{unit.path.stem}_focus.png"
-            selected_focus_lead, _ = save_focus_lead_plot(
+            selected_focus_leads, focus_plot_paths = save_focus_lead_plots(
                 output_path=focus_plot_path,
                 record=record,
                 target_channels=record_target_channels,
                 reconstructed=reconstructed_eval,
                 metrics_row=row,
-                focus_lead=focus_lead,
+                focus_leads=focus_lead,
                 visual_filter_mode=visual_filter_mode,
                 num_beats=focus_num_beats,
                 window_ms=focus_window_ms,
@@ -350,8 +350,8 @@ def _evaluate_checkpoint_on_files(
                 show_segment_metrics=show_segment_metrics,
                 show_rmse_in_titles=show_rmse_in_titles,
             )
-            row["focus_lead"] = selected_focus_lead
-            row["focus_plot_path"] = str(focus_plot_path)
+            row["focus_lead"] = ",".join(selected_focus_leads)
+            row["focus_plot_path"] = ";".join(focus_plot_paths)
         if latent_plot_dir is not None:
             latent_plot_path = latent_plot_dir / f"{unit.path.stem}_latent.png"
             save_latent_space_plot(
