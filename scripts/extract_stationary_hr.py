@@ -286,6 +286,7 @@ def estimate_dft_bpm(values: list[float], sample_rate_hz: float, bpm_min: float,
     start_hz = bpm_min / 60.0
     end_hz = bpm_max / 60.0
     steps = int((end_hz - start_hz) / freq_step_hz) + 1
+    spectrum: list[dict] = []
     for step_idx in range(steps):
         freq = start_hz + step_idx * freq_step_hz
         real = 0.0
@@ -295,15 +296,20 @@ def estimate_dft_bpm(values: list[float], sample_rate_hz: float, bpm_min: float,
             real += value * math.cos(angle)
             imag += value * math.sin(angle)
         power = real * real + imag * imag
+        spectrum.append({"freq_hz": freq, "bpm": freq * 60.0, "power": power})
         if best_power is None or power > best_power:
             best_power = power
             best_freq = freq
     if best_freq is None or best_power is None:
         return {"status": "no_candidate"}
+    top_peaks = sorted(spectrum, key=lambda item: item["power"], reverse=True)[:5]
     return {
         "status": "candidate_only",
         "candidate_bpm": best_freq * 60.0,
         "spectral_power": best_power,
+        "peak_frequency_hz": best_freq,
+        "top_peaks": top_peaks,
+        "spectrum": spectrum,
     }
 
 
@@ -352,6 +358,50 @@ def make_series_svg(values: list[float], out_path: Path, width: int, height: int
   <text x="12" y="20" font-size="14" fill="#343a40">{title}</text>
   <line x1="0" y1="{height / 2.0:.2f}" x2="{width}" y2="{height / 2.0:.2f}" stroke="#adb5bd" stroke-width="1" />
   <polyline fill="none" stroke="#1864ab" stroke-width="2" points="{' '.join(points)}" />
+</svg>
+"""
+    out_path.write_text(svg, encoding="utf-8")
+
+
+def make_spectrum_svg(spectrum: list[dict], out_path: Path, width: int, height: int, title: str, peak_bpm: float | None) -> None:
+    if not spectrum:
+        out_path.write_text("<svg xmlns='http://www.w3.org/2000/svg' width='600' height='120'></svg>", encoding="utf-8")
+        return
+
+    max_power = max(item["power"] for item in spectrum) or 1.0
+    min_bpm = min(item["bpm"] for item in spectrum)
+    max_bpm = max(item["bpm"] for item in spectrum)
+    usable_width = max(width - 80, 1)
+    usable_height = max(height - 70, 1)
+
+    points = []
+    for item in spectrum:
+        x = 50 + ((item["bpm"] - min_bpm) / max(max_bpm - min_bpm, 1e-9)) * usable_width
+        y = height - 30 - ((item["power"] / max_power) * usable_height)
+        points.append(f"{x:.2f},{y:.2f}")
+
+    peak_marker = ""
+    peak_label = ""
+    if peak_bpm is not None:
+        peak_item = min(spectrum, key=lambda item: abs(item["bpm"] - peak_bpm))
+        peak_x = 50 + ((peak_item["bpm"] - min_bpm) / max(max_bpm - min_bpm, 1e-9)) * usable_width
+        peak_y = height - 30 - ((peak_item["power"] / max_power) * usable_height)
+        peak_marker = f'<circle cx="{peak_x:.2f}" cy="{peak_y:.2f}" r="6" fill="#c92a2a" />'
+        peak_label = (
+            f'<text x="{peak_x + 10:.2f}" y="{max(28.0, peak_y - 10):.2f}" '
+            f'font-size="14" fill="#c92a2a">peak {peak_item["bpm"]:.1f} bpm</text>'
+        )
+
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+  <rect width="100%" height="100%" fill="#f8f9fa" />
+  <text x="12" y="20" font-size="14" fill="#343a40">{title}</text>
+  <line x1="50" y1="{height - 30}" x2="{width - 20}" y2="{height - 30}" stroke="#adb5bd" stroke-width="1" />
+  <line x1="50" y1="30" x2="50" y2="{height - 30}" stroke="#adb5bd" stroke-width="1" />
+  <text x="50" y="{height - 8}" font-size="12" fill="#495057">{min_bpm:.0f}</text>
+  <text x="{width - 30}" y="{height - 8}" font-size="12" text-anchor="end" fill="#495057">{max_bpm:.0f} bpm</text>
+  <polyline fill="none" stroke="#1864ab" stroke-width="2" points="{' '.join(points)}" />
+  {peak_marker}
+  {peak_label}
 </svg>
 """
     out_path.write_text(svg, encoding="utf-8")
@@ -409,6 +459,14 @@ def build_direct_branch(
 
     make_series_svg(direct_bandpassed, out_dir / "direct_bandpassed_waveform.svg", 1200, 280, "direct low-frequency bandpassed waveform")
     make_series_svg(direct_smooth, out_dir / "direct_hr_band.svg", 1200, 280, "direct HR-focused waveform")
+    make_spectrum_svg(
+        dft_est.get("spectrum", []),
+        out_dir / "direct_dft_spectrum.svg",
+        1200,
+        320,
+        "direct branch DFT spectrum",
+        dft_est.get("candidate_bpm"),
+    )
     fragment_meta = save_branch_fragments(
         direct_smooth,
         direct_rate,
@@ -430,6 +488,7 @@ def build_direct_branch(
         "artifacts": {
             "bandpassed_waveform_svg": "direct_bandpassed_waveform.svg",
             "hr_waveform_svg": "direct_hr_band.svg",
+            "dft_spectrum_svg": "direct_dft_spectrum.svg",
             "fragment_svgs": fragment_meta,
         },
     }
@@ -463,6 +522,14 @@ def build_envelope_branch(
     make_series_svg(bandpassed, out_dir / "bandpassed_waveform.svg", 1200, 280, "higher-band bandpassed waveform")
     make_series_svg(envelope_ds, out_dir / "hilbert_envelope.svg", 1200, 280, "Hilbert envelope")
     make_series_svg(envelope_hr, out_dir / "envelope_hr_band.svg", 1200, 280, "envelope HR-focused waveform")
+    make_spectrum_svg(
+        dft_est.get("spectrum", []),
+        out_dir / "envelope_dft_spectrum.svg",
+        1200,
+        320,
+        "envelope branch DFT spectrum",
+        dft_est.get("candidate_bpm"),
+    )
     fragment_meta = save_branch_fragments(
         envelope_hr,
         envelope_rate,
@@ -487,6 +554,7 @@ def build_envelope_branch(
             "bandpassed_waveform_svg": "bandpassed_waveform.svg",
             "hilbert_envelope_svg": "hilbert_envelope.svg",
             "hr_waveform_svg": "envelope_hr_band.svg",
+            "dft_spectrum_svg": "envelope_dft_spectrum.svg",
             "fragment_svgs": fragment_meta,
         },
     }
