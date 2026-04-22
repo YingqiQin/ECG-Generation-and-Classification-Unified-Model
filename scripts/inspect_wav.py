@@ -70,17 +70,30 @@ def load_wav_channels(wav_path: Path) -> tuple[list[list[int]], dict]:
         channels = wf.getnchannels()
         sample_width = wf.getsampwidth()
         sample_rate = wf.getframerate()
-        n_frames = wf.getnframes()
+        header_n_frames = wf.getnframes()
         comptype = wf.getcomptype()
         compname = wf.getcompname()
-        raw = wf.readframes(n_frames)
+        raw = wf.readframes(header_n_frames)
 
     if sample_width not in STRUCT_FORMAT_BY_WIDTH:
         raise ValueError(f"Unsupported PCM sample width: {sample_width} bytes")
 
-    total_samples = n_frames * channels
+    frame_width_bytes = sample_width * channels
+    payload_bytes_read = len(raw)
+    payload_bytes_expected = header_n_frames * frame_width_bytes
+    decoded_n_frames = payload_bytes_read // frame_width_bytes
+    trailing_bytes = payload_bytes_read % frame_width_bytes
+    aligned_payload = raw[: decoded_n_frames * frame_width_bytes]
+
+    if decoded_n_frames == 0:
+        raise ValueError(
+            "WAV payload does not contain a complete frame. "
+            f"Expected {frame_width_bytes} bytes per frame, got {payload_bytes_read} bytes."
+        )
+
+    total_samples = decoded_n_frames * channels
     fmt = "<" + STRUCT_FORMAT_BY_WIDTH[sample_width] * total_samples
-    unpacked = struct.unpack(fmt, raw)
+    unpacked = struct.unpack(fmt, aligned_payload)
 
     channel_samples = [[] for _ in range(channels)]
     if sample_width == 1:
@@ -94,11 +107,17 @@ def load_wav_channels(wav_path: Path) -> tuple[list[list[int]], dict]:
         "channels_in_file": channels,
         "sample_width_bytes": sample_width,
         "sample_rate_hz": sample_rate,
-        "n_frames": n_frames,
-        "duration_seconds": n_frames / sample_rate,
+        "n_frames": decoded_n_frames,
+        "duration_seconds": decoded_n_frames / sample_rate,
+        "header_n_frames": header_n_frames,
+        "header_duration_seconds": header_n_frames / sample_rate,
         "compression_type": comptype,
         "compression_name": compname,
         "payload_bitrate_bps": sample_rate * sample_width * 8 * channels,
+        "payload_bytes_expected_from_header": payload_bytes_expected,
+        "payload_bytes_read": payload_bytes_read,
+        "trailing_payload_bytes_ignored": trailing_bytes,
+        "payload_truncated_vs_header": payload_bytes_read < payload_bytes_expected,
     }
     return channel_samples, metadata
 

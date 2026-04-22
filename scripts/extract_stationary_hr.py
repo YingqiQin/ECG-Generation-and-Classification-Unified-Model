@@ -83,20 +83,39 @@ def load_mono_pcm16(wav_path: Path) -> tuple[list[int], dict]:
         channels = wf.getnchannels()
         sample_width = wf.getsampwidth()
         sample_rate = wf.getframerate()
-        n_frames = wf.getnframes()
-        raw = wf.readframes(n_frames)
+        header_n_frames = wf.getnframes()
+        raw = wf.readframes(header_n_frames)
 
     if sample_width != 2:
         raise ValueError(f"Expected 16-bit PCM WAV, got {sample_width}-byte samples")
 
-    values = struct.unpack("<" + ("h" * (n_frames * channels)), raw)
+    frame_width_bytes = sample_width * channels
+    payload_bytes_read = len(raw)
+    payload_bytes_expected = header_n_frames * frame_width_bytes
+    decoded_n_frames = payload_bytes_read // frame_width_bytes
+    trailing_bytes = payload_bytes_read % frame_width_bytes
+    aligned_payload = raw[: decoded_n_frames * frame_width_bytes]
+
+    if decoded_n_frames == 0:
+        raise ValueError(
+            "WAV payload does not contain a complete frame. "
+            f"Expected {frame_width_bytes} bytes per frame, got {payload_bytes_read} bytes."
+        )
+
+    values = struct.unpack("<" + ("h" * (decoded_n_frames * channels)), aligned_payload)
     mono = list(values if channels == 1 else values[0::channels])
     metadata = {
         "channels_in_file": channels,
         "sample_rate_hz": sample_rate,
         "sample_width_bytes": sample_width,
-        "n_frames": n_frames,
-        "duration_seconds": n_frames / sample_rate,
+        "n_frames": decoded_n_frames,
+        "duration_seconds": decoded_n_frames / sample_rate,
+        "header_n_frames": header_n_frames,
+        "header_duration_seconds": header_n_frames / sample_rate,
+        "payload_bytes_expected_from_header": payload_bytes_expected,
+        "payload_bytes_read": payload_bytes_read,
+        "trailing_payload_bytes_ignored": trailing_bytes,
+        "payload_truncated_vs_header": payload_bytes_read < payload_bytes_expected,
     }
     return mono, metadata
 
