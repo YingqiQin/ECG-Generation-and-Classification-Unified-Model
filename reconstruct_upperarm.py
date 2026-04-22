@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import csv
 import math
 from pathlib import Path
@@ -210,6 +211,19 @@ def _estimate_gap_break_threshold_s(timestamps_ms: np.ndarray, factor: float = 1
     return (nominal_step_ms * max(factor, 1.01)) / 1000.0
 
 
+def _tta_holdout_start_seconds(metrics_row: dict[str, object]) -> float | None:
+    if not bool(metrics_row.get("tta_applied", False)):
+        return None
+    raw_value = metrics_row.get("tta_holdout_start_seconds")
+    if raw_value is None:
+        return None
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
 def _apply_gap_breaks(
     time_s: np.ndarray,
     signals: list[np.ndarray],
@@ -277,6 +291,7 @@ def _save_segmented_reconstruction_comparison_plot(
 
     corr_method = str(metrics_row.get("corr_method", "pearson"))
     lag_metrics_enabled = bool(metrics_row.get("lag_metrics_enabled", True))
+    tta_holdout_start_s = _tta_holdout_start_seconds(metrics_row)
     page_size = max(1, int(max_segments_per_figure))
     pages = [
         segment_slices[start:start + page_size]
@@ -300,8 +315,16 @@ def _save_segmented_reconstruction_comparison_plot(
             absolute_start_s = float(record.timestamps_ms[segment_start_idx] - record.timestamps_ms[0]) / 1000.0
             absolute_end_s = float(record.timestamps_ms[segment_stop_idx - 1] - record.timestamps_ms[0]) / 1000.0
             segment_number = (page_idx - 1) * page_size + col_idx + 1
+            segment_tag = ""
+            if tta_holdout_start_s is not None:
+                if absolute_end_s <= tta_holdout_start_s:
+                    segment_tag = " [TTA]"
+                elif absolute_start_s >= tta_holdout_start_s:
+                    segment_tag = " [Post-TTA]"
+                else:
+                    segment_tag = " [Mixed]"
             axes[0, col_idx].set_title(
-                f"seg {segment_number}\n{absolute_start_s:.1f}-{absolute_end_s:.1f}s",
+                f"seg {segment_number}{segment_tag}\n{absolute_start_s:.1f}-{absolute_end_s:.1f}s",
                 fontsize=10,
             )
 
@@ -366,6 +389,8 @@ def _save_segmented_reconstruction_comparison_plot(
             f"{record.path.name} | segmented comparison | kept segments={len(segment_slices)} | "
             f"mean {corr_method}={float(metrics_row[f'mean_{corr_method}']):.3f}"
         )
+        if tta_holdout_start_s is not None:
+            title += f" | TTA first {tta_holdout_start_s:.1f}s"
         if lag_metrics_enabled:
             title += f" | mean lag-{corr_method}={float(metrics_row[f'mean_lag_corrected_{corr_method}']):.3f}"
         if len(pages) > 1:
@@ -425,6 +450,7 @@ def _save_segmented_focus_lead_plot(
     if not segment_slices:
         return
     lead_display_name = _display_lead_name(lead_name)
+    tta_holdout_start_s = _tta_holdout_start_seconds(metrics_row)
 
     page_size = max(1, int(max_segments_per_figure))
     pages = [
@@ -452,6 +478,14 @@ def _save_segmented_focus_lead_plot(
             segment_number = (page_idx - 1) * page_size + col_idx + 1
             absolute_start_s = float(record.timestamps_ms[seg_start] - record.timestamps_ms[0]) / 1000.0
             absolute_end_s = float(record.timestamps_ms[seg_stop - 1] - record.timestamps_ms[0]) / 1000.0
+            segment_tag = ""
+            if tta_holdout_start_s is not None:
+                if absolute_end_s <= tta_holdout_start_s:
+                    segment_tag = " [TTA]"
+                elif absolute_start_s >= tta_holdout_start_s:
+                    segment_tag = " [Post-TTA]"
+                else:
+                    segment_tag = " [Mixed]"
 
             segment_time_s = (
                 record.timestamps_ms[segment_slice].astype(np.float64)
@@ -491,7 +525,7 @@ def _save_segmented_focus_lead_plot(
             overview_ax.axvspan(segment_time_s[left], segment_time_s[max(left, right - 1)], color="gold", alpha=0.18)
             overview_ax.grid(alpha=0.20)
             overview_ax.set_title(
-                f"seg {segment_number}\n{absolute_start_s:.1f}-{absolute_end_s:.1f}s",
+                f"seg {segment_number}{segment_tag}\n{absolute_start_s:.1f}-{absolute_end_s:.1f}s",
                 fontsize=10,
             )
             if show_segment_metrics:
@@ -543,6 +577,8 @@ def _save_segmented_focus_lead_plot(
             f"{record.path.name} | focus_lead={lead_display_name} | segmented focus | "
             f"raw {corr_method}={float(metrics_row[f'{lead_name}_{corr_method}']):.3f}"
         )
+        if tta_holdout_start_s is not None:
+            title += f" | TTA first {tta_holdout_start_s:.1f}s"
         if lag_metrics_enabled:
             title += f" | lag-{corr_method}={float(metrics_row[f'{lead_name}_lag_corrected_{corr_method}']):.3f}"
         if len(pages) > 1:
@@ -1372,6 +1408,7 @@ def save_reconstruction_comparison_plot(
 
     corr_method = str(metrics_row.get("corr_method", "pearson"))
     lag_metrics_enabled = bool(metrics_row.get("lag_metrics_enabled", True))
+    tta_holdout_start_s = _tta_holdout_start_seconds(metrics_row)
     lead_series: list[tuple[str, np.ndarray, np.ndarray, np.ndarray | None, str, str]] = []
     for lead_idx, lead_name in enumerate(target_channels):
         target_display, pred_display, target_label, pred_label = _prepare_display_signals(
@@ -1415,6 +1452,9 @@ def save_reconstruction_comparison_plot(
         ax.plot(time_plot, pred, color="red", linewidth=1.0, alpha=0.8, label=pred_label)
         if lag_metrics_enabled and pred_shifted is not None:
             ax.plot(time_plot, pred_shifted_plot, color="#1f77b4", linewidth=1.0, alpha=0.85, linestyle="--", label="lag-corrected recon")
+        if tta_holdout_start_s is not None:
+            ax.axvspan(0.0, tta_holdout_start_s, color="#2ca02c", alpha=0.08)
+            ax.axvline(tta_holdout_start_s, color="#2ca02c", linestyle="--", linewidth=0.9, alpha=0.8)
         corr_value = float(metrics_row.get(f"{lead_name}_{corr_method}", float("nan")))
         rmse_value = float(metrics_row.get(f"{lead_name}_rmse", float("nan")))
         if lag_metrics_enabled:
@@ -1464,6 +1504,8 @@ def save_reconstruction_comparison_plot(
         )
         if show_rmse_in_titles:
             subtitle += f" | mean rmse={float(metrics_row['mean_rmse']):.3f}"
+    if tta_holdout_start_s is not None:
+        subtitle += f" | TTA first {tta_holdout_start_s:.1f}s"
     fig.suptitle(subtitle, fontsize=12, y=1.01)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
@@ -1500,6 +1542,7 @@ def save_focus_lead_plot(
         requested_lead=focus_lead,
     )
     lead_display_name = _display_lead_name(lead_name)
+    tta_holdout_start_s = _tta_holdout_start_seconds(metrics_row)
 
     time_s = (record.timestamps_ms.astype(np.float64) - float(record.timestamps_ms[0])) / 1000.0
     gap_threshold_s = _estimate_gap_break_threshold_s(record.timestamps_ms)
@@ -1567,6 +1610,9 @@ def save_focus_lead_plot(
     overview_ax.plot(overview_time[::overview_stride], overview_signals[1][::overview_stride], color="red", linewidth=1.0, alpha=0.8, label=pred_label)
     if lag_metrics_enabled:
         overview_ax.plot(overview_time[::overview_stride], overview_signals[2][::overview_stride], color="#1f77b4", linewidth=1.0, alpha=0.85, linestyle="--", label="lag-corrected recon")
+    if tta_holdout_start_s is not None:
+        overview_ax.axvspan(0.0, tta_holdout_start_s, color="#2ca02c", alpha=0.08)
+        overview_ax.axvline(tta_holdout_start_s, color="#2ca02c", linestyle="--", linewidth=0.9, alpha=0.8)
     for center in centers:
         left = max(0, int(center) - half_window_samples)
         right = min(target.shape[0], int(center) + half_window_samples)
@@ -1615,14 +1661,13 @@ def save_focus_lead_plot(
     axes_array[-1].set_xlabel("time relative to center (ms)")
     handles, labels = overview_ax.get_legend_handles_labels()
     fig.legend(handles, labels, loc="upper right")
-    fig.suptitle(
-        (
-            f"{record.path.name} | focus_lead={lead_display_name} | original_fs={record.original_sampling_rate_hz:.1f} Hz "
-            f"-> eval_fs={record.sampling_rate_hz:.1f} Hz | beat-level zoom"
-        ),
-        fontsize=12,
-        y=1.01,
+    suptitle_text = (
+        f"{record.path.name} | focus_lead={lead_display_name} | original_fs={record.original_sampling_rate_hz:.1f} Hz "
+        f"-> eval_fs={record.sampling_rate_hz:.1f} Hz | beat-level zoom"
     )
+    if tta_holdout_start_s is not None:
+        suptitle_text += f" | TTA first {tta_holdout_start_s:.1f}s"
+    fig.suptitle(suptitle_text, fontsize=12, y=1.01)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
@@ -1686,6 +1731,132 @@ def save_focus_lead_plots(
         selected_focus_leads.append(selected_focus_lead)
         output_paths.append(str(lead_output_path))
     return selected_focus_leads, output_paths
+
+
+def _resolve_tta_split_index(record: PreparedUpperArmRecord, adapt_seconds: float) -> int:
+    if adapt_seconds <= 0:
+        return 0
+    time_s = (record.timestamps_ms.astype(np.float64) - float(record.timestamps_ms[0])) / 1000.0
+    split_idx = int(np.searchsorted(time_s, float(adapt_seconds), side="right"))
+    return max(0, min(split_idx, int(time_s.shape[0])))
+
+
+def _build_supervised_windows(
+    record: PreparedUpperArmRecord,
+    usable_length: int,
+    segment_length: int,
+    segment_stride: int,
+    segment_policy: str,
+    padding_mode: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    usable_length = max(0, int(usable_length))
+    starts = compute_window_starts(
+        length=usable_length,
+        signal_length=segment_length,
+        stride=segment_stride,
+        window_policy=segment_policy,
+    )
+    if not starts:
+        return (
+            np.zeros((0, 1, segment_length), dtype=np.float32),
+            np.zeros((0, record.target_signals.shape[0], segment_length), dtype=np.float32),
+        )
+
+    x_windows = np.stack(
+        [
+            _pad_1d(record.input_signal[start:min(usable_length, start + segment_length)], segment_length, padding_mode)
+            for start in starts
+        ],
+        axis=0,
+    )[:, None, :]
+    y_windows = np.stack(
+        [
+            np.stack(
+                [
+                    _pad_1d(
+                        record.target_signals[channel_idx, start:min(usable_length, start + segment_length)],
+                        segment_length,
+                        padding_mode,
+                    )
+                    for channel_idx in range(record.target_signals.shape[0])
+                ],
+                axis=0,
+            )
+            for start in starts
+        ],
+        axis=0,
+    )
+    return x_windows.astype(np.float32, copy=False), y_windows.astype(np.float32, copy=False)
+
+
+def adapt_model_on_record(
+    model: MCMA,
+    record: PreparedUpperArmRecord,
+    adapt_seconds: float,
+    epochs: int,
+    lr: float,
+    batch_size: int,
+    segment_length: int,
+    segment_stride: int,
+    segment_policy: str,
+    padding_mode: str,
+    device: torch.device,
+    seed: int = 42,
+) -> tuple[MCMA, dict[str, object]]:
+    split_idx = _resolve_tta_split_index(record=record, adapt_seconds=adapt_seconds)
+    time_s = (record.timestamps_ms.astype(np.float64) - float(record.timestamps_ms[0])) / 1000.0
+    holdout_start_seconds = float(time_s[split_idx]) if 0 <= split_idx < time_s.shape[0] else float(time_s[-1]) if time_s.size else 0.0
+    stats: dict[str, object] = {
+        "tta_enabled": True,
+        "tta_applied": False,
+        "tta_requested_seconds": float(adapt_seconds),
+        "tta_holdout_start_seconds": holdout_start_seconds,
+        "tta_adapt_samples": int(split_idx),
+        "tta_epochs": int(max(0, epochs)),
+        "tta_windows": 0,
+        "tta_final_loss": float("nan"),
+    }
+    if split_idx <= 1 or split_idx >= record.input_signal.shape[0]:
+        return model, stats
+    if epochs <= 0 or lr <= 0:
+        return model, stats
+
+    x_windows, y_windows = _build_supervised_windows(
+        record=record,
+        usable_length=split_idx,
+        segment_length=segment_length,
+        segment_stride=segment_stride,
+        segment_policy=segment_policy,
+        padding_mode=padding_mode,
+    )
+    if x_windows.shape[0] == 0:
+        return model, stats
+
+    adapted_model = copy.deepcopy(model).to(device)
+    adapted_model.train()
+    optimizer = torch.optim.Adam(adapted_model.parameters(), lr=float(lr))
+    rng = np.random.default_rng(int(seed))
+    effective_batch_size = max(1, int(batch_size))
+    last_loss = float("nan")
+
+    for _ in range(int(epochs)):
+        order = rng.permutation(x_windows.shape[0])
+        for batch_start in range(0, order.shape[0], effective_batch_size):
+            batch_indices = order[batch_start:batch_start + effective_batch_size]
+            x_batch = torch.from_numpy(x_windows[batch_indices]).to(device=device, dtype=torch.float32)
+            y_batch = torch.from_numpy(y_windows[batch_indices]).to(device=device, dtype=torch.float32)
+            optimizer.zero_grad(set_to_none=True)
+            y_hat = adapted_model(x_batch)
+            loss = torch.mean((y_hat - y_batch) ** 2)
+            loss.backward()
+            optimizer.step()
+            last_loss = float(loss.detach().cpu().item())
+
+    adapted_model.eval()
+    stats["tta_applied"] = True
+    stats["tta_windows"] = int(x_windows.shape[0])
+    stats["tta_final_loss"] = last_loss
+    return adapted_model, stats
 
 
 def build_upperarm_model(
@@ -1927,6 +2098,10 @@ def main(argv: list[str] | None = None) -> int:
     lag_search_window_ms = float(reconstruct_cfg.get("lag_search_window_ms", 150.0))
     dtw_max_points = int(reconstruct_cfg.get("dtw_max_points", 2000))
     rpeak_tolerance_ms = float(reconstruct_cfg.get("rpeak_tolerance_ms", 120.0))
+    test_time_adapt_enabled = bool(reconstruct_cfg.get("test_time_adapt_enabled", False))
+    test_time_adapt_seconds = float(reconstruct_cfg.get("test_time_adapt_seconds", 20.0))
+    test_time_adapt_epochs = int(reconstruct_cfg.get("test_time_adapt_epochs", 1))
+    test_time_adapt_lr = float(reconstruct_cfg.get("test_time_adapt_lr", 1e-4))
 
     model_target_channels = list(data_cfg.get("target_channels") or [f"CH{i}" for i in range(1, 9)])
     records = load_upperarm_records(
@@ -1975,11 +2150,39 @@ def main(argv: list[str] | None = None) -> int:
     segment_policy = data_cfg.get("segment_policy", "pad")
     padding_mode = data_cfg.get("padding_mode", "zero")
     batch_size = int(reconstruct_cfg.get("batch_size", data_cfg.get("batch_size", 64)))
+    test_time_adapt_batch_size = int(reconstruct_cfg.get("test_time_adapt_batch_size", batch_size))
 
     metrics_rows: list[dict[str, object]] = []
     for record in records:
+        model_for_record = model
+        tta_stats: dict[str, object] = {
+            "tta_enabled": False,
+            "tta_applied": False,
+            "tta_requested_seconds": float("nan"),
+            "tta_holdout_start_seconds": float("nan"),
+            "tta_adapt_samples": 0,
+            "tta_epochs": 0,
+            "tta_windows": 0,
+            "tta_final_loss": float("nan"),
+        }
+        if test_time_adapt_enabled:
+            model_for_record, tta_stats = adapt_model_on_record(
+                model=model,
+                record=record,
+                adapt_seconds=test_time_adapt_seconds,
+                epochs=test_time_adapt_epochs,
+                lr=test_time_adapt_lr,
+                batch_size=test_time_adapt_batch_size,
+                segment_length=segment_length,
+                segment_stride=segment_stride,
+                segment_policy=segment_policy,
+                padding_mode=padding_mode,
+                device=device,
+                seed=int(config.get("seed", 42)),
+            )
+
         y_hat_full = reconstruct_record(
-            model=model,
+            model=model_for_record,
             record=record,
             segment_length=segment_length,
             segment_stride=segment_stride,
@@ -2017,6 +2220,7 @@ def main(argv: list[str] | None = None) -> int:
         row["missing_target_channels"] = ",".join(
             channel for channel in model_target_channels if channel not in set(record_target_channels)
         )
+        row.update(tta_stats)
         if save_signal_stage_plots:
             raw_signal_plot_path = signal_stage_plot_dir / "raw" / f"{record.path.stem}_raw.png"
             processed_signal_plot_path = signal_stage_plot_dir / "processed" / f"{record.path.stem}_processed.png"
@@ -2076,7 +2280,7 @@ def main(argv: list[str] | None = None) -> int:
             latent_plot_path = latent_plot_dir / f"{record.path.stem}_latent.png"
             save_latent_space_plot(
                 output_path=latent_plot_path,
-                model=model,
+                model=model_for_record,
                 record=record,
                 target_channels=record_target_channels,
                 reconstructed=reconstructed_eval,
@@ -2095,10 +2299,16 @@ def main(argv: list[str] | None = None) -> int:
             row["latent_plot_path"] = str(latent_plot_path)
         metrics_rows.append(row)
 
-        print(
+        message = (
             f"Reconstructed {record.path.name} | mean_{corr_method}={row[f'mean_{corr_method}']:.4f} | "
             f"mean_rmse={row['mean_rmse']:.6f}"
         )
+        if bool(row.get("tta_applied", False)):
+            message += (
+                f" | TTA {float(row['tta_holdout_start_seconds']):.1f}s/{int(row['tta_epochs'])}ep/"
+                f"{int(row['tta_windows'])}win"
+            )
+        print(message)
 
     metrics_path = output_dir / "reconstruction_metrics.csv"
     fieldnames = [
@@ -2109,6 +2319,14 @@ def main(argv: list[str] | None = None) -> int:
         "lag_metrics_enabled",
         "lag_search_window_ms",
         "rpeak_tolerance_ms",
+        "tta_enabled",
+        "tta_applied",
+        "tta_requested_seconds",
+        "tta_holdout_start_seconds",
+        "tta_adapt_samples",
+        "tta_epochs",
+        "tta_windows",
+        "tta_final_loss",
         "available_target_channels",
         "missing_target_channels",
         "raw_signal_plot_path",
