@@ -291,7 +291,6 @@ def _save_segmented_reconstruction_comparison_plot(
 
     corr_method = str(metrics_row.get("corr_method", "pearson"))
     lag_metrics_enabled = bool(metrics_row.get("lag_metrics_enabled", True))
-    tta_holdout_start_s = _tta_holdout_start_seconds(metrics_row)
     page_size = max(1, int(max_segments_per_figure))
     pages = [
         segment_slices[start:start + page_size]
@@ -315,16 +314,8 @@ def _save_segmented_reconstruction_comparison_plot(
             absolute_start_s = float(record.timestamps_ms[segment_start_idx] - record.timestamps_ms[0]) / 1000.0
             absolute_end_s = float(record.timestamps_ms[segment_stop_idx - 1] - record.timestamps_ms[0]) / 1000.0
             segment_number = (page_idx - 1) * page_size + col_idx + 1
-            segment_tag = ""
-            if tta_holdout_start_s is not None:
-                if absolute_end_s <= tta_holdout_start_s:
-                    segment_tag = " [TTA]"
-                elif absolute_start_s >= tta_holdout_start_s:
-                    segment_tag = " [Post-TTA]"
-                else:
-                    segment_tag = " [Mixed]"
             axes[0, col_idx].set_title(
-                f"seg {segment_number}{segment_tag}\n{absolute_start_s:.1f}-{absolute_end_s:.1f}s",
+                f"seg {segment_number}\n{absolute_start_s:.1f}-{absolute_end_s:.1f}s",
                 fontsize=10,
             )
 
@@ -389,8 +380,6 @@ def _save_segmented_reconstruction_comparison_plot(
             f"{record.path.name} | segmented comparison | kept segments={len(segment_slices)} | "
             f"mean {corr_method}={float(metrics_row[f'mean_{corr_method}']):.3f}"
         )
-        if tta_holdout_start_s is not None:
-            title += f" | TTA first {tta_holdout_start_s:.1f}s"
         if lag_metrics_enabled:
             title += f" | mean lag-{corr_method}={float(metrics_row[f'mean_lag_corrected_{corr_method}']):.3f}"
         if len(pages) > 1:
@@ -450,7 +439,6 @@ def _save_segmented_focus_lead_plot(
     if not segment_slices:
         return
     lead_display_name = _display_lead_name(lead_name)
-    tta_holdout_start_s = _tta_holdout_start_seconds(metrics_row)
 
     page_size = max(1, int(max_segments_per_figure))
     pages = [
@@ -478,14 +466,6 @@ def _save_segmented_focus_lead_plot(
             segment_number = (page_idx - 1) * page_size + col_idx + 1
             absolute_start_s = float(record.timestamps_ms[seg_start] - record.timestamps_ms[0]) / 1000.0
             absolute_end_s = float(record.timestamps_ms[seg_stop - 1] - record.timestamps_ms[0]) / 1000.0
-            segment_tag = ""
-            if tta_holdout_start_s is not None:
-                if absolute_end_s <= tta_holdout_start_s:
-                    segment_tag = " [TTA]"
-                elif absolute_start_s >= tta_holdout_start_s:
-                    segment_tag = " [Post-TTA]"
-                else:
-                    segment_tag = " [Mixed]"
 
             segment_time_s = (
                 record.timestamps_ms[segment_slice].astype(np.float64)
@@ -525,7 +505,7 @@ def _save_segmented_focus_lead_plot(
             overview_ax.axvspan(segment_time_s[left], segment_time_s[max(left, right - 1)], color="gold", alpha=0.18)
             overview_ax.grid(alpha=0.20)
             overview_ax.set_title(
-                f"seg {segment_number}{segment_tag}\n{absolute_start_s:.1f}-{absolute_end_s:.1f}s",
+                f"seg {segment_number}\n{absolute_start_s:.1f}-{absolute_end_s:.1f}s",
                 fontsize=10,
             )
             if show_segment_metrics:
@@ -577,8 +557,6 @@ def _save_segmented_focus_lead_plot(
             f"{record.path.name} | focus_lead={lead_display_name} | segmented focus | "
             f"raw {corr_method}={float(metrics_row[f'{lead_name}_{corr_method}']):.3f}"
         )
-        if tta_holdout_start_s is not None:
-            title += f" | TTA first {tta_holdout_start_s:.1f}s"
         if lag_metrics_enabled:
             title += f" | lag-{corr_method}={float(metrics_row[f'{lead_name}_lag_corrected_{corr_method}']):.3f}"
         if len(pages) > 1:
