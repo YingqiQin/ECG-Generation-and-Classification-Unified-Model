@@ -4,6 +4,7 @@ import hashlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import xml.etree.ElementTree as ET
+import warnings
 import torch
 import numpy as np
 import pandas as pd
@@ -59,6 +60,15 @@ def _sanitize_signal_array(arr: np.ndarray) -> np.ndarray:
     if np.isfinite(arr).all():
         return arr.astype(np.float32, copy=False)
     return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+
+
+def _required_leads_for_mode(lead_mode: str) -> List[str]:
+    lead_mode = validate_lead_mode(lead_mode)
+    if lead_mode == "12":
+        return list(STD_LEAD_ORDER)
+    if lead_mode.endswith("_1ch"):
+        return [lead_mode[:-4]]
+    return [lead_mode]
 
 
 def make_patient_split(
@@ -220,8 +230,7 @@ XML_LEAD_CODE_TO_STD = {
     "MDC_ECG_LEAD_V6": "V6",
 }
 
-
-def _load_hl7_xml_12xT(xml_path: Path) -> Tuple[np.ndarray, int]:
+def _parse_hl7_xml_lead_dict(xml_path: Path) -> Tuple[Dict[str, np.ndarray], int]:
     root = ET.parse(xml_path).getroot()
 
     rhythm_series = None
@@ -265,24 +274,50 @@ def _load_hl7_xml_12xT(xml_path: Path) -> Tuple[np.ndarray, int]:
         scale = 1.0 if scale_node is None else float(scale_node.attrib.get("value", 1.0))
         lead_data[lead_name] = origin + scale * digits
 
-    missing = [lead for lead in STD_LEAD_ORDER if lead not in lead_data]
-    if missing:
-        raise ValueError("XML ECG '{}' is missing leads: {}.".format(xml_path, ", ".join(missing)))
-
-    lengths = {lead: lead_data[lead].shape[0] for lead in STD_LEAD_ORDER}
-    if len(set(lengths.values())) != 1:
-        raise ValueError("XML ECG '{}' has inconsistent lead lengths: {}.".format(xml_path, lengths))
-
     fs = 500
     if time_increment is not None and time_increment > 0:
         fs = int(round(1.0 / time_increment))
 
-    arr = np.stack([lead_data[lead] for lead in STD_LEAD_ORDER], axis=0).astype(np.float32, copy=False)
+    return lead_data, fs
+
+
+def _available_hl7_xml_leads(xml_path: Path) -> List[str]:
+    lead_data, _ = _parse_hl7_xml_lead_dict(xml_path)
+    return sorted(lead_data.keys(), key=lambda x: STD_LEAD_ORDER.index(x))
+
+
+def _load_hl7_xml_12xT(xml_path: Path, required_leads: Optional[List[str]] = None) -> Tuple[np.ndarray, int]:
+    lead_data, fs = _parse_hl7_xml_lead_dict(xml_path)
+    required = list(STD_LEAD_ORDER if required_leads is None else required_leads)
+    missing_required = [lead for lead in required if lead not in lead_data]
+    if missing_required:
+        raise ValueError(
+            "XML ECG '{}' is missing required leads: {}.".format(xml_path, ", ".join(missing_required))
+        )
+
+    lengths = {lead: signal.shape[0] for lead, signal in lead_data.items()}
+    if len(set(lengths.values())) != 1:
+        raise ValueError("XML ECG '{}' has inconsistent lead lengths: {}.".format(xml_path, lengths))
+
+    target_len = next(iter(lengths.values()))
+    rows = []
+    for lead in STD_LEAD_ORDER:
+        if lead in lead_data:
+            rows.append(lead_data[lead])
+        else:
+            rows.append(np.zeros(target_len, dtype=np.float32))
+
+    arr = np.stack(rows, axis=0).astype(np.float32, copy=False)
     arr = _sanitize_signal_array(arr)
     return arr, fs
 
 
-def _load_signal_12xT(signal_path: Path, signal_format: str, fallback_fs: Optional[int] = None) -> Tuple[np.ndarray, int]:
+def _load_signal_12xT(
+    signal_path: Path,
+    signal_format: str,
+    fallback_fs: Optional[int] = None,
+    required_leads: Optional[List[str]] = None,
+) -> Tuple[np.ndarray, int]:
     if signal_format == "npy":
         arr = np.load(signal_path, allow_pickle=False, mmap_mode=None).astype(np.float32)
         arr = ECGMILDataset._ensure_shape_12xT(arr)
@@ -292,8 +327,40 @@ def _load_signal_12xT(signal_path: Path, signal_format: str, fallback_fs: Option
     if signal_format == "wfdb":
         return _load_wfdb_12xT(signal_path)
     if signal_format == "xml":
-        return _load_hl7_xml_12xT(signal_path)
+        return _load_hl7_xml_12xT(signal_path, required_leads=required_leads)
     raise ValueError("Unsupported signal format '{}'.".format(signal_format))
+
+
+def _available_signal_leads(signal_path: Path, signal_format: str) -> List[str]:
+    if signal_format == "xml":
+        return _available_hl7_xml_leads(signal_path)
+    return list(STD_LEAD_ORDER)
+
+
+def _filter_records_by_required_leads(records, required_leads: List[str], record_attr: str) -> List:
+    kept = []
+    dropped = []
+    required_set = set(required_leads)
+    for rec in records:
+        if rec.signal_format != "xml":
+            kept.append(rec)
+            continue
+        available = set(_available_signal_leads(getattr(rec, record_attr), rec.signal_format))
+        missing = sorted(required_set - available, key=lambda x: STD_LEAD_ORDER.index(x))
+        if missing:
+            dropped.append((str(getattr(rec, record_attr)), missing))
+            continue
+        kept.append(rec)
+    if dropped:
+        preview = ", ".join("{} missing {}".format(Path(path).name, missing) for path, missing in dropped[:3])
+        warnings.warn(
+            "Dropped {} XML record(s) missing required leads {}. Examples: {}".format(
+                len(dropped),
+                required_leads,
+                preview,
+            )
+        )
+    return kept
 
 
 def validate_lead_mode(lead_mode: str) -> str:
@@ -427,6 +494,8 @@ class ECGMILDataset(Dataset):
                 xml_file=str(r['xml_file']),
                 patient_id=str(r['patient_id']),
             ))
+        self.required_leads = _required_leads_for_mode(self.lead_mode)
+        self.records = _filter_records_by_required_leads(self.records, self.required_leads, record_attr="npy_path")
         self.seg_len = int(round(self.seg_sec * self.target_fs))  # 10s -> 5000
         self.stride = int(round(self.stride_sec * self.target_fs))
 
@@ -529,15 +598,18 @@ class ECGMILDataset(Dataset):
             rng = self._make_deterministic_rng(rec)
         else:
             rng = np.random
-        arr, src_fs = _load_signal_12xT(rec.npy_path, rec.signal_format, fallback_fs=rec.fs)
+        arr, src_fs = _load_signal_12xT(
+            rec.npy_path,
+            rec.signal_format,
+            fallback_fs=rec.fs,
+            required_leads=self.required_leads,
+        )
         arr = _sanitize_signal_array(arr)
 
-        # 先统一到 500Hz（对 1000Hz：直接每 2 点取 1 点）
-        arr_500 = self._resample_to_500(arr, src_fs)
-
-        # 带通滤波（在 segment 级别做；轻量且符合你“少预处理”的原则）
+        # If filtering is enabled, do it at the source sampling rate before 1000->500 decimation.
         if self._bp is not None:
-            arr_500 = self._bp.apply(arr_500, fs=self.target_fs)
+            arr = self._bp.apply(arr, fs=src_fs)
+        arr_500 = self._resample_to_500(arr, src_fs)
         arr_500 = _sanitize_signal_array(arr_500)
 
         T = arr_500.shape[-1]
@@ -724,9 +796,14 @@ class ECGLeadTransferDataset(Dataset):
                     n_samples=n_samples_value,
                     record_id=record_id,
                     patient_id=patient_id,
+                    )
                 )
-            )
 
+        self.required_leads = sorted(
+            set(_required_leads_for_mode(self.teacher_lead_mode)) | set(_required_leads_for_mode(self.student_lead_mode)),
+            key=lambda x: STD_LEAD_ORDER.index(x),
+        )
+        self.records = _filter_records_by_required_leads(self.records, self.required_leads, record_attr="signal_path")
         self._bp = BandpassFilter(low_hz=0.5, high_hz=40.0, order=4) if self.bandpass else None
 
     def __len__(self) -> int:
@@ -760,12 +837,17 @@ class ECGLeadTransferDataset(Dataset):
         rec = self.records[idx]
         rng = self._make_deterministic_rng(rec) if self.deterministic else np.random
 
-        arr, src_fs = _load_signal_12xT(rec.signal_path, rec.signal_format, fallback_fs=rec.fs)
+        arr, src_fs = _load_signal_12xT(
+            rec.signal_path,
+            rec.signal_format,
+            fallback_fs=rec.fs,
+            required_leads=self.required_leads,
+        )
         arr = _sanitize_signal_array(arr)
-        arr_500 = ECGMILDataset._resample_to_500(arr, src_fs)
 
         if self._bp is not None:
-            arr_500 = self._bp.apply(arr_500, fs=self.target_fs)
+            arr = self._bp.apply(arr, fs=src_fs)
+        arr_500 = ECGMILDataset._resample_to_500(arr, src_fs)
         arr_500 = _sanitize_signal_array(arr_500)
 
         T = arr_500.shape[-1]
