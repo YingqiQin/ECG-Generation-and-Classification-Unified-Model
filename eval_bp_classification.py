@@ -60,6 +60,8 @@ class Metrics:
     fn: int
     precision: float
     recall: float
+    sensitivity: float
+    specificity: float
     accuracy: float
     f1: float
 
@@ -180,6 +182,8 @@ def build_metrics(
     fn: int,
     precision: float,
     recall: float,
+    sensitivity: float,
+    specificity: float,
     accuracy: float,
     f1: float,
 ) -> Metrics:
@@ -193,6 +197,8 @@ def build_metrics(
         fn=fn,
         precision=precision,
         recall=recall,
+        sensitivity=sensitivity,
+        specificity=specificity,
         accuracy=accuracy,
         f1=f1,
     )
@@ -280,6 +286,8 @@ def compute_subject_metrics(
 
     precision = safe_div(tp, tp + fp)
     recall = safe_div(tp, tp + fn)
+    sensitivity = recall
+    specificity = safe_div(tn, tn + fp)
     accuracy = safe_div(tp + tn, n_subjects)
     f1 = safe_div(2 * precision * recall, precision + recall)
 
@@ -293,6 +301,8 @@ def compute_subject_metrics(
         fn=fn,
         precision=precision,
         recall=recall,
+        sensitivity=sensitivity,
+        specificity=specificity,
         accuracy=accuracy,
         f1=f1,
     )
@@ -323,6 +333,8 @@ def compute_micro_metrics(
 
     precision = safe_div(tp, tp + fp)
     recall = safe_div(tp, tp + fn)
+    sensitivity = recall
+    specificity = safe_div(tn, tn + fp)
     accuracy = safe_div(tp + tn, n_rows)
     f1 = safe_div(2 * precision * recall, precision + recall)
 
@@ -336,6 +348,8 @@ def compute_micro_metrics(
         fn=fn,
         precision=precision,
         recall=recall,
+        sensitivity=sensitivity,
+        specificity=specificity,
         accuracy=accuracy,
         f1=f1,
     )
@@ -363,6 +377,8 @@ def compute_macro_metrics(
             fn=0,
             precision=0.0,
             recall=0.0,
+            sensitivity=0.0,
+            specificity=0.0,
             accuracy=0.0,
             f1=0.0,
         )
@@ -378,6 +394,8 @@ def compute_macro_metrics(
 
     subject_precisions: List[float] = []
     subject_recalls: List[float] = []
+    subject_sensitivities: List[float] = []
+    subject_specificities: List[float] = []
     subject_accuracies: List[float] = []
     subject_f1s: List[float] = []
 
@@ -398,11 +416,15 @@ def compute_macro_metrics(
 
         precision = safe_div(tp, tp + fp)
         recall = safe_div(tp, tp + fn)
+        sensitivity = recall
+        specificity = safe_div(tn, tn + fp)
         accuracy = safe_div(tp + tn, subject_n_rows)
         f1 = safe_div(2 * precision * recall, precision + recall)
 
         subject_precisions.append(precision)
         subject_recalls.append(recall)
+        subject_sensitivities.append(sensitivity)
+        subject_specificities.append(specificity)
         subject_accuracies.append(accuracy)
         subject_f1s.append(f1)
 
@@ -416,6 +438,8 @@ def compute_macro_metrics(
         fn=total_counts["fn"],
         precision=sum(subject_precisions) / len(subject_precisions),
         recall=sum(subject_recalls) / len(subject_recalls),
+        sensitivity=sum(subject_sensitivities) / len(subject_sensitivities),
+        specificity=sum(subject_specificities) / len(subject_specificities),
         accuracy=sum(subject_accuracies) / len(subject_accuracies),
         f1=sum(subject_f1s) / len(subject_f1s),
     )
@@ -437,6 +461,8 @@ def print_metrics(name: str, metrics: Metrics, threshold: Threshold) -> None:
         f"{count_label}: tp={metrics.tp} tn={metrics.tn} fp={metrics.fp} fn={metrics.fn} | "
         f"precision={format_metric(metrics.precision)} "
         f"recall={format_metric(metrics.recall)} "
+        f"sensitivity={format_metric(metrics.sensitivity)} "
+        f"specificity={format_metric(metrics.specificity)} "
         f"accuracy={format_metric(metrics.accuracy)} "
         f"f1={format_metric(metrics.f1)}"
     )
