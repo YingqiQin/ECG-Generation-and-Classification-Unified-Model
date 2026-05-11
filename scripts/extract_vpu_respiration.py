@@ -1,0 +1,958 @@
+#!/usr/bin/env python3
+"""RespEar-inspired respiration extraction for VPU WAV files.
+
+This script is separate from the in-ear HR pipeline. It treats VPU respiration
+as a weak periodic rhythm problem and adds motion-aware candidate scoring plus
+SSA decomposition so motion-dominant low-frequency peaks do not automatically
+win over plausible breathing components.
+
+Expected input shape: mono or multi-channel PCM16 WAV. If a file is
+multi-channel, channel 0 is used. The processing is non-causal because it
+analyzes full windows.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+from pathlib import Path
+
+from extract_stationary_hr import (
+    centered,
+    decimate_mean,
+    estimate_autocorr_bpm,
+    estimate_dft_bpm,
+    fir_filter,
+    load_mono_pcm16,
+    make_bandpass_fir,
+    make_series_svg,
+    moving_average,
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Extract VPU respiration-rate candidates from a WAV file.")
+    parser.add_argument("wav_path", type=Path, help="Path to VPU WAV file")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("data/interim"),
+        help="Base output directory",
+    )
+    parser.add_argument(
+        "--analysis-rate",
+        type=float,
+        default=100.0,
+        help="Target sample rate for low-frequency VPU analysis",
+    )
+    parser.add_argument(
+        "--respiration-rate",
+        type=float,
+        default=20.0,
+        help="Target sample rate for respiration curves before CPM estimation",
+    )
+    parser.add_argument(
+        "--window-seconds",
+        type=float,
+        default=60.0,
+        help="Analysis window length in seconds",
+    )
+    parser.add_argument(
+        "--hop-seconds",
+        type=float,
+        default=30.0,
+        help="Hop length between analysis windows in seconds",
+    )
+    parser.add_argument(
+        "--cpm-min",
+        type=float,
+        default=8.0,
+        help="Lower breaths-per-minute bound",
+    )
+    parser.add_argument(
+        "--cpm-max",
+        type=float,
+        default=40.0,
+        help="Upper breaths-per-minute bound",
+    )
+    parser.add_argument(
+        "--direct-low-hz",
+        type=float,
+        default=0.10,
+        help="Lower cutoff for direct respiration branch",
+    )
+    parser.add_argument(
+        "--direct-high-hz",
+        type=float,
+        default=0.70,
+        help="Upper cutoff for direct respiration branch",
+    )
+    parser.add_argument(
+        "--motion-low-hz",
+        type=float,
+        default=0.05,
+        help="Lower bound for motion-spectrum inspection",
+    )
+    parser.add_argument(
+        "--motion-high-hz",
+        type=float,
+        default=3.0,
+        help="Upper bound for motion-spectrum inspection",
+    )
+    parser.add_argument(
+        "--preset",
+        choices=["auto", "stationary", "motion"],
+        default="auto",
+        help="Condition prior used only for scoring/rejection",
+    )
+    parser.add_argument(
+        "--motion-min-cpm",
+        type=float,
+        default=14.0,
+        help="Motion windows below this CPM are treated as suspicious unless strongly supported",
+    )
+    parser.add_argument(
+        "--expected-cpm",
+        type=float,
+        default=None,
+        help="Optional reference CPM for evaluation only; not used for selecting candidates",
+    )
+    parser.add_argument(
+        "--ssa-window-seconds",
+        type=float,
+        default=6.0,
+        help="SSA embedding window in seconds on the respiration-rate curve",
+    )
+    parser.add_argument(
+        "--ssa-components",
+        type=int,
+        default=8,
+        help="Maximum SSA components to inspect",
+    )
+    return parser.parse_args()
+
+
+def clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def rms(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return math.sqrt(sum(value * value for value in values) / len(values))
+
+
+def stddev(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    mean = sum(values) / len(values)
+    variance = sum((value - mean) * (value - mean) for value in values) / len(values)
+    return math.sqrt(max(variance, 0.0))
+
+
+def peak_dominance_from_dft(dft_estimate: dict, candidate_cpm: float | None = None) -> float:
+    peaks = dft_estimate.get("top_peaks") or []
+    if not peaks:
+        return 0.0
+    if candidate_cpm is None:
+        first_power = peaks[0].get("power", 0.0)
+    else:
+        first_power = min(peaks, key=lambda item: abs(item["bpm"] - candidate_cpm)).get("power", 0.0)
+    competitors = [peak.get("power", 0.0) for peak in peaks if abs(peak["bpm"] - (candidate_cpm or peaks[0]["bpm"])) > 1e-9]
+    second_power = max(competitors, default=0.0)
+    return first_power / max(second_power, 1e-12)
+
+
+def estimate_peak_count_cpm(values: list[float], sample_rate_hz: float, cpm_min: float, cpm_max: float) -> dict:
+    """Estimate CPM by counting separated local maxima.
+
+    This is deliberately conservative and used as a supporting check, not as a
+    standalone estimator.
+    """
+    if len(values) < 3:
+        return {"status": "insufficient_data"}
+    signal = centered(values)
+    sigma = stddev(signal)
+    if sigma <= 0.0:
+        return {"status": "flat_signal"}
+    threshold = 0.25 * sigma
+    min_gap = max(int(sample_rate_hz * 60.0 / cpm_max * 0.65), 1)
+    peaks: list[int] = []
+    last_peak = -min_gap
+    for idx in range(1, len(signal) - 1):
+        if idx - last_peak < min_gap:
+            continue
+        if signal[idx] > threshold and signal[idx] >= signal[idx - 1] and signal[idx] > signal[idx + 1]:
+            peaks.append(idx)
+            last_peak = idx
+    duration_seconds = len(values) / sample_rate_hz
+    if duration_seconds <= 0.0 or not peaks:
+        return {"status": "no_peak"}
+    cpm = len(peaks) * 60.0 / duration_seconds
+    return {
+        "status": "candidate_only",
+        "peak_count": len(peaks),
+        "candidate_cpm": cpm,
+        "duration_seconds": duration_seconds,
+    }
+
+
+def make_rate_spectrum_svg(
+    spectrum: list[dict],
+    out_path: Path,
+    width: int,
+    height: int,
+    title: str,
+    peak_cpm: float | None,
+) -> None:
+    if not spectrum:
+        out_path.write_text("<svg xmlns='http://www.w3.org/2000/svg' width='600' height='120'></svg>", encoding="utf-8")
+        return
+
+    max_power = max(item["power"] for item in spectrum) or 1.0
+    min_cpm = min(item["bpm"] for item in spectrum)
+    max_cpm = max(item["bpm"] for item in spectrum)
+    usable_width = max(width - 80, 1)
+    usable_height = max(height - 70, 1)
+
+    points = []
+    for item in spectrum:
+        x = 50 + ((item["bpm"] - min_cpm) / max(max_cpm - min_cpm, 1e-9)) * usable_width
+        y = height - 30 - ((item["power"] / max_power) * usable_height)
+        points.append(f"{x:.2f},{y:.2f}")
+
+    peak_marker = ""
+    peak_label = ""
+    if peak_cpm is not None:
+        peak_item = min(spectrum, key=lambda item: abs(item["bpm"] - peak_cpm))
+        peak_x = 50 + ((peak_item["bpm"] - min_cpm) / max(max_cpm - min_cpm, 1e-9)) * usable_width
+        peak_y = height - 30 - ((peak_item["power"] / max_power) * usable_height)
+        peak_marker = f'<circle cx="{peak_x:.2f}" cy="{peak_y:.2f}" r="6" fill="#c92a2a" />'
+        peak_label = (
+            f'<text x="{peak_x + 10:.2f}" y="{max(28.0, peak_y - 10):.2f}" '
+            f'font-size="14" fill="#c92a2a">peak {peak_item["bpm"]:.1f} CPM</text>'
+        )
+
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+  <rect width="100%" height="100%" fill="#f8f9fa" />
+  <text x="12" y="20" font-size="14" fill="#343a40">{title}</text>
+  <line x1="50" y1="{height - 30}" x2="{width - 20}" y2="{height - 30}" stroke="#adb5bd" stroke-width="1" />
+  <line x1="50" y1="30" x2="50" y2="{height - 30}" stroke="#adb5bd" stroke-width="1" />
+  <text x="50" y="{height - 8}" font-size="12" fill="#495057">{min_cpm:.0f}</text>
+  <text x="{width - 30}" y="{height - 8}" font-size="12" text-anchor="end" fill="#495057">{max_cpm:.0f} CPM</text>
+  <polyline fill="none" stroke="#1864ab" stroke-width="2" points="{' '.join(points)}" />
+  {peak_marker}
+  {peak_label}
+</svg>
+"""
+    out_path.write_text(svg, encoding="utf-8")
+
+
+def jacobi_eigen_symmetric(matrix: list[list[float]], max_sweeps: int = 80, tolerance: float = 1e-10) -> list[tuple[float, list[float]]]:
+    """Return eigenpairs for a small symmetric matrix using Jacobi rotations."""
+    n = len(matrix)
+    if n == 0:
+        return []
+    a = [row[:] for row in matrix]
+    vectors = [[1.0 if i == j else 0.0 for j in range(n)] for i in range(n)]
+
+    for _ in range(max_sweeps):
+        p = 0
+        q = 1 if n > 1 else 0
+        max_offdiag = 0.0
+        for i in range(n):
+            for j in range(i + 1, n):
+                value = abs(a[i][j])
+                if value > max_offdiag:
+                    max_offdiag = value
+                    p = i
+                    q = j
+        if max_offdiag < tolerance or p == q:
+            break
+
+        app = a[p][p]
+        aqq = a[q][q]
+        apq = a[p][q]
+        tau = (aqq - app) / (2.0 * apq) if abs(apq) > 1e-20 else 0.0
+        t = math.copysign(1.0 / (abs(tau) + math.sqrt(1.0 + tau * tau)), tau) if tau != 0.0 else 1.0
+        c = 1.0 / math.sqrt(1.0 + t * t)
+        s = t * c
+
+        for k in range(n):
+            if k != p and k != q:
+                akp = a[k][p]
+                akq = a[k][q]
+                a[k][p] = c * akp - s * akq
+                a[p][k] = a[k][p]
+                a[k][q] = s * akp + c * akq
+                a[q][k] = a[k][q]
+
+        a[p][p] = c * c * app - 2.0 * s * c * apq + s * s * aqq
+        a[q][q] = s * s * app + 2.0 * s * c * apq + c * c * aqq
+        a[p][q] = 0.0
+        a[q][p] = 0.0
+
+        for k in range(n):
+            vkp = vectors[k][p]
+            vkq = vectors[k][q]
+            vectors[k][p] = c * vkp - s * vkq
+            vectors[k][q] = s * vkp + c * vkq
+
+    eigenpairs = []
+    for idx in range(n):
+        eigenvector = [vectors[row][idx] for row in range(n)]
+        eigenpairs.append((max(a[idx][idx], 0.0), eigenvector))
+    eigenpairs.sort(key=lambda item: item[0], reverse=True)
+    return eigenpairs
+
+
+def ssa_decompose(values: list[float], window_length: int, max_components: int) -> list[dict]:
+    """Decompose a 1D signal into SSA reconstructed components.
+
+    Input shape: one respiration-rate curve, `[time]`.
+    Output shape: list of components, each with a reconstructed `[time]` series.
+    """
+    n = len(values)
+    window_length = max(2, min(window_length, n // 2 if n >= 4 else 2))
+    if n < 8 or window_length >= n:
+        return []
+
+    signal = centered(values)
+    k_count = n - window_length + 1
+    covariance = [[0.0 for _ in range(window_length)] for _ in range(window_length)]
+    for i in range(window_length):
+        for j in range(i, window_length):
+            total = 0.0
+            for k in range(k_count):
+                total += signal[i + k] * signal[j + k]
+            value = total / k_count
+            covariance[i][j] = value
+            covariance[j][i] = value
+
+    eigenpairs = jacobi_eigen_symmetric(covariance)
+    total_eigenvalue = sum(value for value, _ in eigenpairs) or 1.0
+    components = []
+    for component_index, (eigenvalue, eigenvector) in enumerate(eigenpairs[:max_components]):
+        pcs = []
+        for k in range(k_count):
+            pcs.append(sum(eigenvector[i] * signal[i + k] for i in range(window_length)))
+
+        reconstructed = [0.0] * n
+        counts = [0] * n
+        for i in range(window_length):
+            for k, pc in enumerate(pcs):
+                reconstructed[i + k] += eigenvector[i] * pc
+                counts[i + k] += 1
+        for idx, count in enumerate(counts):
+            if count:
+                reconstructed[idx] /= count
+
+        components.append(
+            {
+                "component_index": component_index,
+                "eigenvalue": eigenvalue,
+                "energy_fraction": eigenvalue / total_eigenvalue,
+                "values": reconstructed,
+            }
+        )
+    return components
+
+
+def build_respiration_curves(
+    window_signal: list[float],
+    analysis_rate: float,
+    respiration_rate: float,
+    low_hz: float,
+    high_hz: float,
+) -> dict:
+    taps = make_bandpass_fir(analysis_rate, low_hz, high_hz, num_taps=257)
+    direct_bandpassed = fir_filter(window_signal, taps)
+    stride = max(int(analysis_rate / respiration_rate), 1)
+    direct_ds = decimate_mean(direct_bandpassed, stride)
+    curve_rate = analysis_rate / stride
+    direct_curve = moving_average(direct_ds, max(int(curve_rate * 0.25), 1))
+
+    abs_envelope = moving_average([abs(value) for value in window_signal], max(int(analysis_rate * 0.20), 1))
+    envelope_ds = decimate_mean(abs_envelope, stride)
+    envelope_smooth = moving_average(envelope_ds, max(int(curve_rate * 0.50), 1))
+    slow_trend = moving_average(envelope_smooth, max(int(curve_rate * 5.0), 1))
+    envelope_curve = [value - trend for value, trend in zip(envelope_smooth, slow_trend)]
+    envelope_curve = moving_average(envelope_curve, max(int(curve_rate * 0.50), 1))
+
+    return {
+        "direct_bandpassed": direct_bandpassed,
+        "direct_curve": direct_curve,
+        "envelope_curve": envelope_curve,
+        "curve_rate_hz": curve_rate,
+    }
+
+
+def inspect_motion(window_signal: list[float], analysis_rate: float, motion_low_hz: float, motion_high_hz: float) -> dict:
+    motion_min_cpm = motion_low_hz * 60.0
+    motion_max_cpm = motion_high_hz * 60.0
+    dft = estimate_dft_bpm(window_signal, analysis_rate, bpm_min=motion_min_cpm, bpm_max=motion_max_cpm)
+    dominance = peak_dominance_from_dft(dft)
+    return {
+        "dft_estimate": dft,
+        "dominant_motion_cpm": dft.get("candidate_bpm"),
+        "dominance_ratio": dominance,
+    }
+
+
+def make_candidate(
+    source: str,
+    cpm: float,
+    power: float,
+    dominance: float,
+    score_seed: float,
+    extra: dict | None = None,
+) -> dict:
+    return {
+        "source": source,
+        "candidate_cpm": cpm,
+        "power": power,
+        "dominance_ratio": dominance,
+        "score_seed": score_seed,
+        **(extra or {}),
+    }
+
+
+def dft_candidates_from_signal(
+    source: str,
+    signal: list[float],
+    sample_rate_hz: float,
+    cpm_min: float,
+    cpm_max: float,
+    max_candidates: int = 5,
+) -> tuple[list[dict], dict, dict, dict]:
+    dft = estimate_dft_bpm(signal, sample_rate_hz, bpm_min=cpm_min, bpm_max=cpm_max)
+    autocorr = estimate_autocorr_bpm(signal, sample_rate_hz, bpm_min=cpm_min, bpm_max=cpm_max)
+    peak_count = estimate_peak_count_cpm(signal, sample_rate_hz, cpm_min, cpm_max)
+    candidates: list[dict] = []
+    peaks = dft.get("top_peaks") or []
+    for rank, peak in enumerate(peaks[:max_candidates]):
+        dominance = peak_dominance_from_dft(dft, candidate_cpm=peak["bpm"])
+        seed = math.log10(max(peak["power"], 1.0)) + min(dominance, 6.0)
+        candidates.append(
+            make_candidate(
+                source,
+                peak["bpm"],
+                peak["power"],
+                dominance,
+                seed,
+                {
+                    "rank": rank + 1,
+                    "autocorr_cpm": autocorr.get("candidate_bpm"),
+                    "autocorr_strength": autocorr.get("autocorrelation"),
+                    "peak_count_cpm": peak_count.get("candidate_cpm"),
+                },
+            )
+        )
+    return candidates, dft, autocorr, peak_count
+
+
+def close_to_any(value: float, targets: list[float], tolerance: float) -> bool:
+    return any(abs(value - target) <= tolerance for target in targets if target > 0.0)
+
+
+def score_candidate(candidate: dict, motion_profile: dict, preset: str, motion_min_cpm: float) -> tuple[float, list[str]]:
+    score = candidate["score_seed"]
+    reasons: list[str] = []
+    cpm = candidate["candidate_cpm"]
+
+    if candidate["source"] == "direct":
+        score += 5.0
+        reasons.append("direct_vpu_support")
+
+    autocorr_cpm = candidate.get("autocorr_cpm")
+    autocorr_strength = candidate.get("autocorr_strength") or 0.0
+    if autocorr_cpm is not None:
+        delta = abs(cpm - autocorr_cpm)
+        if delta <= 3.0:
+            score += 3.0 + max(autocorr_strength, 0.0)
+            reasons.append("autocorr_agrees")
+        elif delta <= 7.0:
+            score += 1.0
+            reasons.append("autocorr_nearby")
+
+    peak_count_cpm = candidate.get("peak_count_cpm")
+    if peak_count_cpm is not None:
+        delta = abs(cpm - peak_count_cpm)
+        if delta <= 4.0:
+            score += 1.5
+            reasons.append("peak_count_agrees")
+
+    if candidate["source"].startswith("ssa"):
+        score += 1.0 + 3.0 * min(candidate.get("energy_fraction", 0.0), 0.5)
+        reasons.append("ssa_support")
+
+    motion_like = preset == "motion"
+    if preset == "auto":
+        motion_cpm = motion_profile.get("dominant_motion_cpm")
+        dominance = motion_profile.get("dominance_ratio") or 0.0
+        motion_like = bool(motion_cpm and dominance >= 8.0 and (motion_cpm < 8.0 or motion_cpm > 45.0))
+
+    motion_cpm = motion_profile.get("dominant_motion_cpm") or 0.0
+    motion_targets = [motion_cpm, motion_cpm / 2.0, motion_cpm / 3.0, motion_cpm * 2.0]
+    if motion_like and cpm < motion_min_cpm:
+        score -= 8.0
+        reasons.append("motion_low_cpm_penalty")
+    if motion_like and candidate["source"] != "direct" and cpm <= motion_min_cpm + 1.0:
+        score -= 8.0
+        reasons.append("motion_low_nondirect_penalty")
+    if motion_like and close_to_any(cpm, motion_targets, tolerance=1.5):
+        score -= 3.0
+        reasons.append("near_motion_or_subharmonic")
+
+    return score, reasons
+
+
+def source_family(source: str) -> str:
+    if source == "direct":
+        return "direct"
+    if source == "envelope":
+        return "envelope"
+    if source == "ssa_aggregate":
+        return "ssa_aggregate"
+    if source.startswith("ssa_component"):
+        return "ssa_component"
+    return source
+
+
+def combine_scored_candidates(scored: list[dict], tolerance_cpm: float = 2.5) -> list[dict]:
+    groups: list[dict] = []
+    for candidate in sorted(scored, key=lambda item: item["score"], reverse=True):
+        target_group = None
+        for group in groups:
+            if abs(candidate["candidate_cpm"] - group["candidate_cpm"]) <= tolerance_cpm:
+                target_group = group
+                break
+        if target_group is None:
+            target_group = {
+                "candidate_cpm": candidate["candidate_cpm"],
+                "support_sources": [],
+                "members": [],
+                "score_weighted_total": 0.0,
+                "weight_total": 0.0,
+            }
+            groups.append(target_group)
+        weight = max(candidate["score"], 0.1)
+        target_group["score_weighted_total"] += candidate["candidate_cpm"] * weight
+        target_group["weight_total"] += weight
+        target_group["support_sources"].append(candidate["source"])
+        target_group["members"].append(candidate)
+
+    for group in groups:
+        if group["weight_total"] > 0.0:
+            group["candidate_cpm"] = group["score_weighted_total"] / group["weight_total"]
+        family_scores: dict[str, float] = {}
+        for member in group["members"]:
+            family = source_family(member["source"])
+            family_scores[family] = max(family_scores.get(family, -1e12), member["score"])
+        group["support_families"] = sorted(family_scores)
+        group["support_count"] = len(group["support_families"])
+        group["combined_score"] = sum(family_scores.values()) + 1.5 * max(group["support_count"] - 1, 0)
+        group["support_sources"] = sorted(set(group["support_sources"]))
+        del group["score_weighted_total"]
+        del group["weight_total"]
+
+    direct_groups = [group for group in groups if "direct" in group.get("support_families", [])]
+    for group in groups:
+        if "direct" in group.get("support_families", []):
+            continue
+        for direct_group in direct_groups:
+            direct_cpm = direct_group["candidate_cpm"]
+            if abs(group["candidate_cpm"] - 2.0 * direct_cpm) <= tolerance_cpm:
+                group["combined_score"] -= 45.0
+                group["harmonic_penalty"] = "near_double_direct_candidate"
+                break
+
+    groups.sort(key=lambda item: item["combined_score"], reverse=True)
+    return groups
+
+
+def select_final_candidate(groups: list[dict]) -> dict:
+    if not groups:
+        return {
+            "status": "rejected",
+            "rr_cpm": None,
+            "confidence": 0.0,
+            "reject_reason": "no_candidate",
+        }
+    best = groups[0]
+    second_score = groups[1]["combined_score"] if len(groups) > 1 else 0.0
+    margin = best["combined_score"] - second_score
+    confidence = clamp(0.18 * margin + 0.12 * best["support_count"] + 0.02 * best["combined_score"], 0.0, 1.0)
+    status = "valid" if confidence >= 0.35 else "low_confidence"
+    reject_reason = None if status == "valid" else "weak_candidate_margin_or_support"
+    return {
+        "status": status,
+        "rr_cpm": best["candidate_cpm"],
+        "confidence": confidence,
+        "reject_reason": reject_reason,
+        "selected_group": best,
+        "runner_up": groups[1] if len(groups) > 1 else None,
+    }
+
+
+def analyze_window(
+    window_signal: list[float],
+    analysis_rate: float,
+    args: argparse.Namespace,
+    out_dir: Path,
+    window_index: int,
+    start_seconds: float,
+) -> dict:
+    prefix = f"window_{window_index:02d}"
+    curves = build_respiration_curves(
+        window_signal,
+        analysis_rate,
+        args.respiration_rate,
+        args.direct_low_hz,
+        args.direct_high_hz,
+    )
+    direct_curve = curves["direct_curve"]
+    envelope_curve = curves["envelope_curve"]
+    curve_rate = curves["curve_rate_hz"]
+
+    motion_profile = inspect_motion(window_signal, analysis_rate, args.motion_low_hz, args.motion_high_hz)
+    direct_candidates, direct_dft, direct_autocorr, direct_peak_count = dft_candidates_from_signal(
+        "direct",
+        direct_curve,
+        curve_rate,
+        args.cpm_min,
+        args.cpm_max,
+    )
+    envelope_candidates, envelope_dft, envelope_autocorr, envelope_peak_count = dft_candidates_from_signal(
+        "envelope",
+        envelope_curve,
+        curve_rate,
+        args.cpm_min,
+        args.cpm_max,
+    )
+
+    ssa_window = max(int(curve_rate * args.ssa_window_seconds), 8)
+    ssa_window = min(ssa_window, 80)
+    components = ssa_decompose(envelope_curve, ssa_window, args.ssa_components)
+    ssa_candidates: list[dict] = []
+    retained_components: list[dict] = []
+    aggregate = [0.0 for _ in envelope_curve]
+    for component in components:
+        component_candidates, component_dft, component_autocorr, component_peak_count = dft_candidates_from_signal(
+            f"ssa_component_{component['component_index']:02d}",
+            component["values"],
+            curve_rate,
+            args.cpm_min,
+            args.cpm_max,
+            max_candidates=2,
+        )
+        best_cpm = component_dft.get("candidate_bpm")
+        dominance = peak_dominance_from_dft(component_dft)
+        peak_count_cpm = component_peak_count.get("candidate_cpm")
+        is_plausible = best_cpm is not None and args.cpm_min <= best_cpm <= args.cpm_max
+        if peak_count_cpm is not None and abs(best_cpm - peak_count_cpm) > 10.0:
+            is_plausible = False
+        if dominance < 0.35:
+            is_plausible = False
+        component_meta = {
+            "component_index": component["component_index"],
+            "energy_fraction": component["energy_fraction"],
+            "dft_estimate": component_dft,
+            "autocorr_estimate": component_autocorr,
+            "peak_count_estimate": component_peak_count,
+            "retained": is_plausible,
+        }
+        if component["component_index"] < 4:
+            component_svg = f"{prefix}_ssa_component_{component['component_index']:02d}.svg"
+            make_series_svg(
+                component["values"],
+                out_dir / component_svg,
+                1200,
+                240,
+                f"{prefix} SSA component {component['component_index']}",
+            )
+            component_meta["svg"] = component_svg
+        if is_plausible:
+            retained_components.append(component_meta)
+            for idx, value in enumerate(component["values"]):
+                aggregate[idx] += value
+            for candidate in component_candidates:
+                candidate["energy_fraction"] = component["energy_fraction"]
+                ssa_candidates.append(candidate)
+        else:
+            retained_components.append(component_meta)
+
+    aggregate_candidates: list[dict] = []
+    aggregate_dft: dict = {"status": "no_candidate"}
+    if any(value != 0.0 for value in aggregate):
+        aggregate_candidates, aggregate_dft, _, _ = dft_candidates_from_signal(
+            "ssa_aggregate",
+            aggregate,
+            curve_rate,
+            args.cpm_min,
+            args.cpm_max,
+            max_candidates=3,
+        )
+
+    raw_candidates = direct_candidates + envelope_candidates + ssa_candidates + aggregate_candidates
+    scored: list[dict] = []
+    for candidate in raw_candidates:
+        score, reasons = score_candidate(candidate, motion_profile, args.preset, args.motion_min_cpm)
+        scored.append({**candidate, "score": score, "score_reasons": reasons})
+    groups = combine_scored_candidates(scored)
+    final = select_final_candidate(groups)
+
+    make_series_svg(window_signal, out_dir / f"{prefix}_analysis_signal.svg", 1200, 260, f"{prefix} VPU analysis signal")
+    make_series_svg(direct_curve, out_dir / f"{prefix}_direct_curve.svg", 1200, 260, f"{prefix} direct respiration curve")
+    make_series_svg(envelope_curve, out_dir / f"{prefix}_envelope_curve.svg", 1200, 260, f"{prefix} envelope respiration curve")
+    make_series_svg(aggregate, out_dir / f"{prefix}_ssa_aggregate.svg", 1200, 260, f"{prefix} retained SSA aggregate")
+    make_rate_spectrum_svg(
+        direct_dft.get("spectrum", []),
+        out_dir / f"{prefix}_direct_dft_spectrum.svg",
+        1200,
+        320,
+        f"{prefix} direct branch CPM spectrum",
+        direct_dft.get("candidate_bpm"),
+    )
+    make_rate_spectrum_svg(
+        envelope_dft.get("spectrum", []),
+        out_dir / f"{prefix}_envelope_dft_spectrum.svg",
+        1200,
+        320,
+        f"{prefix} envelope branch CPM spectrum",
+        envelope_dft.get("candidate_bpm"),
+    )
+    make_rate_spectrum_svg(
+        motion_profile["dft_estimate"].get("spectrum", []),
+        out_dir / f"{prefix}_motion_spectrum.svg",
+        1200,
+        320,
+        f"{prefix} motion inspection spectrum",
+        motion_profile.get("dominant_motion_cpm"),
+    )
+    make_rate_spectrum_svg(
+        aggregate_dft.get("spectrum", []),
+        out_dir / f"{prefix}_ssa_aggregate_spectrum.svg",
+        1200,
+        320,
+        f"{prefix} retained SSA aggregate CPM spectrum",
+        aggregate_dft.get("candidate_bpm"),
+    )
+
+    expected_error = None
+    if args.expected_cpm is not None and final.get("rr_cpm") is not None:
+        expected_error = final["rr_cpm"] - args.expected_cpm
+
+    return {
+        "window_index": window_index,
+        "start_seconds": start_seconds,
+        "end_seconds": start_seconds + len(window_signal) / analysis_rate,
+        "duration_seconds": len(window_signal) / analysis_rate,
+        "preset": args.preset,
+        "rms": rms(window_signal),
+        "motion_profile": motion_profile,
+        "branches": {
+            "direct": {
+                "dft_estimate": direct_dft,
+                "autocorr_estimate": direct_autocorr,
+                "peak_count_estimate": direct_peak_count,
+            },
+            "envelope": {
+                "dft_estimate": envelope_dft,
+                "autocorr_estimate": envelope_autocorr,
+                "peak_count_estimate": envelope_peak_count,
+            },
+            "ssa": {
+                "embedding_window_samples": ssa_window,
+                "embedding_window_seconds": ssa_window / curve_rate,
+                "retained_components": retained_components,
+                "aggregate_dft_estimate": aggregate_dft,
+            },
+        },
+        "candidate_groups": groups,
+        "final_estimate": {
+            **final,
+            "expected_cpm": args.expected_cpm,
+            "error_vs_expected_cpm": expected_error,
+        },
+        "artifacts": {
+            "analysis_signal_svg": f"{prefix}_analysis_signal.svg",
+            "direct_curve_svg": f"{prefix}_direct_curve.svg",
+            "envelope_curve_svg": f"{prefix}_envelope_curve.svg",
+            "direct_dft_spectrum_svg": f"{prefix}_direct_dft_spectrum.svg",
+            "envelope_dft_spectrum_svg": f"{prefix}_envelope_dft_spectrum.svg",
+            "motion_spectrum_svg": f"{prefix}_motion_spectrum.svg",
+            "ssa_aggregate_svg": f"{prefix}_ssa_aggregate.svg",
+            "ssa_aggregate_spectrum_svg": f"{prefix}_ssa_aggregate_spectrum.svg",
+        },
+    }
+
+
+def build_windows(signal: list[float], sample_rate_hz: float, window_seconds: float, hop_seconds: float) -> list[tuple[int, list[float]]]:
+    window_len = max(int(window_seconds * sample_rate_hz), 1)
+    hop_len = max(int(hop_seconds * sample_rate_hz), 1)
+    if len(signal) <= window_len:
+        return [(0, signal)]
+    windows = []
+    start = 0
+    while start + window_len <= len(signal):
+        windows.append((start, signal[start : start + window_len]))
+        start += hop_len
+    if windows and windows[-1][0] + window_len < len(signal):
+        final_start = max(len(signal) - window_len, 0)
+        if final_start != windows[-1][0]:
+            windows.append((final_start, signal[final_start:]))
+    return windows
+
+
+def make_trend_svg(windows: list[dict], out_path: Path, expected_cpm: float | None) -> None:
+    width = 1200
+    height = 320
+    valid_points = [
+        (
+            (window["start_seconds"] + window["end_seconds"]) / 2.0,
+            window["final_estimate"].get("rr_cpm"),
+            window["final_estimate"].get("confidence", 0.0),
+            window["final_estimate"].get("status"),
+        )
+        for window in windows
+        if window["final_estimate"].get("rr_cpm") is not None
+    ]
+    if not valid_points:
+        out_path.write_text("<svg xmlns='http://www.w3.org/2000/svg' width='600' height='120'></svg>", encoding="utf-8")
+        return
+    min_time = min(point[0] for point in valid_points)
+    max_time = max(point[0] for point in valid_points)
+    min_cpm = min(point[1] for point in valid_points if point[1] is not None)
+    max_cpm = max(point[1] for point in valid_points if point[1] is not None)
+    if expected_cpm is not None:
+        min_cpm = min(min_cpm, expected_cpm)
+        max_cpm = max(max_cpm, expected_cpm)
+    min_cpm -= 3.0
+    max_cpm += 3.0
+    usable_width = width - 100
+    usable_height = height - 80
+
+    circles = []
+    line_points = []
+    for time_s, cpm, confidence, status in valid_points:
+        x = 60 + ((time_s - min_time) / max(max_time - min_time, 1e-9)) * usable_width
+        y = height - 40 - ((cpm - min_cpm) / max(max_cpm - min_cpm, 1e-9)) * usable_height
+        color = "#2b8a3e" if status == "valid" else "#f08c00"
+        radius = 4.0 + 5.0 * confidence
+        circles.append(f'<circle cx="{x:.2f}" cy="{y:.2f}" r="{radius:.2f}" fill="{color}" opacity="0.85" />')
+        line_points.append(f"{x:.2f},{y:.2f}")
+
+    expected_line = ""
+    if expected_cpm is not None:
+        y = height - 40 - ((expected_cpm - min_cpm) / max(max_cpm - min_cpm, 1e-9)) * usable_height
+        expected_line = (
+            f'<line x1="60" y1="{y:.2f}" x2="{width - 40}" y2="{y:.2f}" '
+            f'stroke="#c92a2a" stroke-width="2" stroke-dasharray="6 4" />'
+            f'<text x="{width - 44}" y="{y - 8:.2f}" font-size="13" text-anchor="end" fill="#c92a2a">expected {expected_cpm:.1f} CPM</text>'
+        )
+
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+  <rect width="100%" height="100%" fill="#f8f9fa" />
+  <text x="12" y="24" font-size="16" fill="#343a40">VPU respiration trend</text>
+  <line x1="60" y1="{height - 40}" x2="{width - 40}" y2="{height - 40}" stroke="#adb5bd" stroke-width="1" />
+  <line x1="60" y1="40" x2="60" y2="{height - 40}" stroke="#adb5bd" stroke-width="1" />
+  <polyline fill="none" stroke="#1864ab" stroke-width="2" points="{' '.join(line_points)}" />
+  {''.join(circles)}
+  {expected_line}
+  <text x="60" y="{height - 12}" font-size="12" fill="#495057">{min_time:.0f}s</text>
+  <text x="{width - 40}" y="{height - 12}" font-size="12" text-anchor="end" fill="#495057">{max_time:.0f}s</text>
+  <text x="8" y="55" font-size="12" fill="#495057">{max_cpm:.1f} CPM</text>
+  <text x="8" y="{height - 42}" font-size="12" fill="#495057">{min_cpm:.1f} CPM</text>
+</svg>
+"""
+    out_path.write_text(svg, encoding="utf-8")
+
+
+def summarize_overall(windows: list[dict]) -> dict:
+    usable = [
+        window["final_estimate"]
+        for window in windows
+        if window["final_estimate"].get("rr_cpm") is not None and window["final_estimate"].get("status") == "valid"
+    ]
+    if not usable:
+        return {"status": "no_valid_windows"}
+    rates = sorted(item["rr_cpm"] for item in usable)
+    median = rates[len(rates) // 2]
+    mean = sum(rates) / len(rates)
+    return {
+        "status": "valid_windows_present",
+        "valid_window_count": len(usable),
+        "total_window_count": len(windows),
+        "mean_rr_cpm": mean,
+        "median_rr_cpm": median,
+        "min_rr_cpm": min(rates),
+        "max_rr_cpm": max(rates),
+    }
+
+
+def main() -> None:
+    args = parse_args()
+    if args.cpm_min <= 0.0:
+        raise SystemExit("--cpm-min must be positive.")
+    if args.cpm_max <= args.cpm_min:
+        raise SystemExit("--cpm-max must be greater than --cpm-min.")
+    if args.window_seconds <= 0.0 or args.hop_seconds <= 0.0:
+        raise SystemExit("--window-seconds and --hop-seconds must be positive.")
+
+    out_dir = args.output_dir / args.wav_path.stem / "vpu_respiration"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    samples, metadata = load_mono_pcm16(args.wav_path)
+    raw = [float(sample) for sample in samples]
+    analysis_stride = max(int(metadata["sample_rate_hz"] / args.analysis_rate), 1)
+    analysis_signal = centered(decimate_mean(raw, analysis_stride))
+    analysis_rate = metadata["sample_rate_hz"] / analysis_stride
+    make_series_svg(analysis_signal, out_dir / "analysis_signal.svg", 1200, 280, "full VPU decimated analysis signal")
+
+    window_results = []
+    for window_index, (start_sample, window_signal) in enumerate(
+        build_windows(analysis_signal, analysis_rate, args.window_seconds, args.hop_seconds)
+    ):
+        window_results.append(
+            analyze_window(
+                window_signal,
+                analysis_rate,
+                args,
+                out_dir,
+                window_index,
+                start_sample / analysis_rate,
+            )
+        )
+
+    make_trend_svg(window_results, out_dir / "rr_trend.svg", args.expected_cpm)
+
+    summary = {
+        "file_name": args.wav_path.name,
+        "metadata": metadata,
+        "vpu_respiration": {
+            "method": "respear_inspired_motion_aware_ssa",
+            "analysis_rate_hz": analysis_rate,
+            "respiration_curve_rate_hz": args.respiration_rate,
+            "cpm_search_min": args.cpm_min,
+            "cpm_search_max": args.cpm_max,
+            "window_seconds": args.window_seconds,
+            "hop_seconds": args.hop_seconds,
+            "preset": args.preset,
+            "expected_cpm": args.expected_cpm,
+            "overall": summarize_overall(window_results),
+            "windows": window_results,
+            "artifacts": {
+                "analysis_signal_svg": "analysis_signal.svg",
+                "rr_trend_svg": "rr_trend.svg",
+            },
+        },
+    }
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    print(f"Saved VPU respiration summary to {out_dir / 'summary.json'}")
+    print(f"Saved VPU respiration trend to {out_dir / 'rr_trend.svg'}")
+
+
+if __name__ == "__main__":
+    main()
