@@ -133,6 +133,33 @@ def parse_args() -> argparse.Namespace:
         help="Condition prior used only for scoring/rejection",
     )
     parser.add_argument(
+        "--selection-policy",
+        choices=["auto", "stationary_legacy_envelope", "motion_robust"],
+        default="auto",
+        help=(
+            "Final candidate policy. auto uses the legacy Hilbert-envelope branch first for stationary VPU, "
+            "while motion_robust keeps the multi-branch RespEar-style selector."
+        ),
+    )
+    parser.add_argument(
+        "--legacy-envelope-rate",
+        type=float,
+        default=50.0,
+        help="Target curve rate for the stationary legacy Hilbert-envelope branch",
+    )
+    parser.add_argument(
+        "--boundary-guard-cpm",
+        type=float,
+        default=2.0,
+        help="Reject final candidates closer than this to --cpm-min as lower-bound locks",
+    )
+    parser.add_argument(
+        "--legacy-min-dominance",
+        type=float,
+        default=1.05,
+        help="Minimum DFT peak dominance for accepting the stationary legacy envelope branch",
+    )
+    parser.add_argument(
         "--motion-min-cpm",
         type=float,
         default=14.0,
@@ -440,6 +467,58 @@ def build_respiration_curves(
     }
 
 
+def build_stationary_legacy_envelope_curve(
+    window_signal: list[float],
+    analysis_rate: float,
+    target_curve_rate: float,
+    carrier_low_hz: float,
+    carrier_high_hz: float,
+) -> dict:
+    """Mirror extract_stationary_hr.build_envelope_branch for stationary VPU files.
+
+    Input shape: one mono analysis window, `[time]`, already centered and
+    decimated. The branch is non-causal and returns a one-dimensional envelope
+    curve for CPM estimation.
+    """
+    nyquist = analysis_rate / 2.0
+    safe_carrier_high = min(carrier_high_hz, nyquist * 0.90)
+    if target_curve_rate <= 0.0 or not (0.0 < carrier_low_hz < safe_carrier_high):
+        return {
+            "status": "invalid_band_or_rate",
+            "bandpassed": [],
+            "hilbert_envelope": [],
+            "curve": [],
+            "curve_rate_hz": 0.0,
+            "carrier_energy_ratio": 0.0,
+            "carrier_envelope_low_hz": carrier_low_hz,
+            "carrier_envelope_high_hz": safe_carrier_high,
+        }
+
+    taps = make_bandpass_fir(analysis_rate, carrier_low_hz, safe_carrier_high, num_taps=129)
+    bandpassed = fir_filter(window_signal, taps)
+    analytic = analytic_signal(bandpassed)
+    hilbert_envelope = [abs(value) for value in analytic]
+
+    stride = max(int(analysis_rate / target_curve_rate), 1)
+    envelope_ds = decimate_mean(hilbert_envelope, stride)
+    curve_rate = analysis_rate / stride
+    envelope_smooth = moving_average(envelope_ds, max(int(curve_rate * 0.20), 1))
+    slow_trend = moving_average(envelope_smooth, max(int(curve_rate * 2.0), 1))
+    legacy_curve = [value - trend for value, trend in zip(envelope_smooth, slow_trend)]
+    legacy_curve = moving_average(legacy_curve, max(int(curve_rate * 0.30), 1))
+
+    return {
+        "status": "ok",
+        "bandpassed": bandpassed,
+        "hilbert_envelope": hilbert_envelope,
+        "curve": legacy_curve,
+        "curve_rate_hz": curve_rate,
+        "carrier_energy_ratio": rms(bandpassed) / max(rms(window_signal), 1e-12),
+        "carrier_envelope_low_hz": carrier_low_hz,
+        "carrier_envelope_high_hz": safe_carrier_high,
+    }
+
+
 def inspect_motion(window_signal: list[float], analysis_rate: float, motion_low_hz: float, motion_high_hz: float) -> dict:
     motion_min_cpm = motion_low_hz * 60.0
     motion_max_cpm = motion_high_hz * 60.0
@@ -512,18 +591,27 @@ def close_to_any(value: float, targets: list[float], tolerance: float) -> bool:
     return any(abs(value - target) <= tolerance for target in targets if target > 0.0)
 
 
-def score_candidate(candidate: dict, motion_profile: dict, preset: str, motion_min_cpm: float) -> tuple[float, list[str]]:
+def score_candidate(
+    candidate: dict,
+    motion_profile: dict,
+    preset: str,
+    motion_min_cpm: float,
+    boundary_guard_cpm: float,
+) -> tuple[float, list[str]]:
     score = candidate["score_seed"]
     reasons: list[str] = []
     cpm = candidate["candidate_cpm"]
     lower_edge_distance = candidate.get("lower_edge_distance_cpm")
 
-    if lower_edge_distance is not None and lower_edge_distance < 2.0:
+    if lower_edge_distance is not None and lower_edge_distance < boundary_guard_cpm:
         if candidate["source"] in {"direct", "envelope"}:
             score -= 4.0
             reasons.append("near_lower_bound_penalty")
         elif candidate["source"].startswith("ssa"):
             score -= 2.0
+            reasons.append("near_lower_bound_penalty")
+        elif candidate["source"] == "stationary_legacy_envelope":
+            score -= 8.0
             reasons.append("near_lower_bound_penalty")
 
     if candidate["source"] == "direct":
@@ -547,6 +635,17 @@ def score_candidate(candidate: dict, motion_profile: dict, preset: str, motion_m
         else:
             score += 1.0
             reasons.append("carrier_envelope_support")
+
+    if candidate["source"] == "stationary_legacy_envelope":
+        if preset == "stationary":
+            score += 14.0
+            reasons.append("legacy_envelope_stationary_support")
+        elif preset == "auto":
+            score += 3.0
+            reasons.append("legacy_envelope_auto_support")
+        else:
+            score += 1.0
+            reasons.append("legacy_envelope_support")
 
     autocorr_cpm = candidate.get("autocorr_cpm")
     autocorr_strength = candidate.get("autocorr_strength") or 0.0
@@ -598,6 +697,8 @@ def source_family(source: str) -> str:
         return "envelope"
     if source == "carrier_envelope":
         return "carrier_envelope"
+    if source == "stationary_legacy_envelope":
+        return "stationary_legacy_envelope"
     if source == "ssa_aggregate":
         return "ssa_aggregate"
     if source.startswith("ssa_component"):
@@ -605,7 +706,12 @@ def source_family(source: str) -> str:
     return source
 
 
-def combine_scored_candidates(scored: list[dict], preset: str, tolerance_cpm: float = 2.5) -> list[dict]:
+def combine_scored_candidates(
+    scored: list[dict],
+    preset: str,
+    boundary_guard_cpm: float,
+    tolerance_cpm: float = 2.5,
+) -> list[dict]:
     groups: list[dict] = []
     for candidate in sorted(scored, key=lambda item: item["score"], reverse=True):
         target_group = None
@@ -644,7 +750,10 @@ def combine_scored_candidates(scored: list[dict], preset: str, tolerance_cpm: fl
             if member.get("lower_edge_distance_cpm") is not None
         ]
         group["min_lower_edge_distance_cpm"] = min(lower_edge_distances) if lower_edge_distances else None
-        if group["min_lower_edge_distance_cpm"] is not None and group["min_lower_edge_distance_cpm"] < 2.0:
+        if (
+            group["min_lower_edge_distance_cpm"] is not None
+            and group["min_lower_edge_distance_cpm"] < boundary_guard_cpm
+        ):
             group["boundary_warning"] = "near_cpm_min"
         group["support_sources"] = sorted(set(group["support_sources"]))
         del group["score_weighted_total"]
@@ -687,9 +796,14 @@ def select_final_candidate(groups: list[dict]) -> dict:
     status = "valid" if confidence >= 0.35 else "low_confidence"
     reject_reason = None if status == "valid" else "weak_candidate_margin_or_support"
     if best.get("boundary_warning") == "near_cpm_min":
-        confidence = min(confidence, 0.34)
-        status = "low_confidence"
-        reject_reason = "candidate_near_cpm_min_boundary"
+        return {
+            "status": "rejected",
+            "rr_cpm": None,
+            "confidence": 0.0,
+            "reject_reason": "candidate_near_cpm_min_boundary",
+            "selected_group": best,
+            "runner_up": groups[1] if len(groups) > 1 else None,
+        }
     return {
         "status": status,
         "rr_cpm": best["candidate_cpm"],
@@ -698,6 +812,124 @@ def select_final_candidate(groups: list[dict]) -> dict:
         "selected_group": best,
         "runner_up": groups[1] if len(groups) > 1 else None,
     }
+
+
+def make_policy_final(candidate: dict, source: str, selection_policy: str, confidence: float) -> dict:
+    group = {
+        "candidate_cpm": candidate["candidate_cpm"],
+        "support_sources": [source],
+        "support_families": [source_family(source)],
+        "support_count": 1,
+        "combined_score": candidate.get("score", candidate.get("score_seed", 0.0)),
+        "members": [candidate],
+    }
+    return {
+        "status": "valid",
+        "rr_cpm": candidate["candidate_cpm"],
+        "confidence": confidence,
+        "reject_reason": None,
+        "selection_policy": selection_policy,
+        "selected_group": group,
+        "runner_up": None,
+    }
+
+
+def select_stationary_legacy_envelope(
+    legacy_candidates: list[dict],
+    carrier_energy_ratio: float,
+    min_energy_ratio: float,
+    boundary_guard_cpm: float,
+    min_dominance: float,
+    selection_policy: str,
+) -> dict:
+    if carrier_energy_ratio < min_energy_ratio:
+        return {
+            "status": "rejected",
+            "rr_cpm": None,
+            "confidence": 0.0,
+            "reject_reason": "stationary_legacy_envelope_low_carrier_energy",
+            "selection_policy": selection_policy,
+        }
+    if not legacy_candidates:
+        return {
+            "status": "rejected",
+            "rr_cpm": None,
+            "confidence": 0.0,
+            "reject_reason": "stationary_legacy_envelope_no_candidate",
+            "selection_policy": selection_policy,
+        }
+
+    best = sorted(legacy_candidates, key=lambda item: item.get("rank", 999))[0]
+    lower_edge_distance = best.get("lower_edge_distance_cpm")
+    if lower_edge_distance is not None and lower_edge_distance < boundary_guard_cpm:
+        return {
+            "status": "rejected",
+            "rr_cpm": None,
+            "confidence": 0.0,
+            "reject_reason": "stationary_legacy_envelope_near_cpm_min_boundary",
+            "selection_policy": selection_policy,
+            "selected_group": {
+                "candidate_cpm": best["candidate_cpm"],
+                "support_sources": ["stationary_legacy_envelope"],
+                "support_families": ["stationary_legacy_envelope"],
+                "support_count": 1,
+                "boundary_warning": "near_cpm_min",
+                "members": [best],
+            },
+        }
+
+    dominance = best.get("dominance_ratio", 0.0)
+    if dominance < min_dominance:
+        return {
+            "status": "low_confidence",
+            "rr_cpm": best["candidate_cpm"],
+            "confidence": 0.25,
+            "reject_reason": "stationary_legacy_envelope_weak_dft_dominance",
+            "selection_policy": selection_policy,
+            "selected_group": {
+                "candidate_cpm": best["candidate_cpm"],
+                "support_sources": ["stationary_legacy_envelope"],
+                "support_families": ["stationary_legacy_envelope"],
+                "support_count": 1,
+                "members": [best],
+            },
+        }
+
+    confidence = clamp(0.48 + 0.09 * min(dominance, 4.0) + 0.08 * min(carrier_energy_ratio, 1.0), 0.0, 1.0)
+    return make_policy_final(best, "stationary_legacy_envelope", selection_policy, confidence)
+
+
+def choose_window_final(
+    groups: list[dict],
+    legacy_candidates: list[dict],
+    legacy_energy_ratio: float,
+    args: argparse.Namespace,
+) -> dict:
+    default_final = select_final_candidate(groups)
+    default_final.setdefault("selection_policy", "motion_robust" if args.preset == "motion" else "multi_branch")
+
+    use_legacy_first = args.selection_policy == "stationary_legacy_envelope" or (
+        args.selection_policy == "auto" and args.preset == "stationary"
+    )
+    if not use_legacy_first:
+        default_final["selection_policy"] = args.selection_policy
+        return default_final
+
+    legacy_final = select_stationary_legacy_envelope(
+        legacy_candidates,
+        legacy_energy_ratio,
+        args.carrier_min_energy_ratio,
+        args.boundary_guard_cpm,
+        args.legacy_min_dominance,
+        "stationary_legacy_envelope",
+    )
+    if legacy_final["status"] == "valid":
+        return legacy_final
+    if args.selection_policy == "stationary_legacy_envelope":
+        return legacy_final
+
+    default_final["legacy_fallback_reason"] = legacy_final.get("reject_reason")
+    return default_final
 
 
 def analyze_window(
@@ -722,6 +954,15 @@ def analyze_window(
     envelope_curve = curves["envelope_curve"]
     carrier_envelope_curve = curves["carrier_envelope_curve"]
     curve_rate = curves["curve_rate_hz"]
+    legacy_curves = build_stationary_legacy_envelope_curve(
+        window_signal,
+        analysis_rate,
+        args.legacy_envelope_rate,
+        args.carrier_envelope_low_hz,
+        args.carrier_envelope_high_hz,
+    )
+    legacy_envelope_curve = legacy_curves["curve"]
+    legacy_curve_rate = legacy_curves["curve_rate_hz"]
 
     motion_profile = inspect_motion(window_signal, analysis_rate, args.motion_low_hz, args.motion_high_hz)
     direct_candidates, direct_dft, direct_autocorr, direct_peak_count = dft_candidates_from_signal(
@@ -755,6 +996,19 @@ def analyze_window(
         }
         carrier_autocorr = {"status": "skipped_low_carrier_energy"}
         carrier_peak_count = {"status": "skipped_low_carrier_energy"}
+    if legacy_envelope_curve:
+        legacy_candidates, legacy_dft, legacy_autocorr, legacy_peak_count = dft_candidates_from_signal(
+            "stationary_legacy_envelope",
+            legacy_envelope_curve,
+            legacy_curve_rate,
+            args.cpm_min,
+            args.cpm_max,
+        )
+    else:
+        legacy_candidates = []
+        legacy_dft = {"status": legacy_curves["status"]}
+        legacy_autocorr = {"status": legacy_curves["status"]}
+        legacy_peak_count = {"status": legacy_curves["status"]}
 
     ssa_window = max(int(curve_rate * args.ssa_window_seconds), 8)
     ssa_window = min(ssa_window, 80)
@@ -822,10 +1076,16 @@ def analyze_window(
     raw_candidates = direct_candidates + envelope_candidates + carrier_candidates + ssa_candidates + aggregate_candidates
     scored: list[dict] = []
     for candidate in raw_candidates:
-        score, reasons = score_candidate(candidate, motion_profile, args.preset, args.motion_min_cpm)
+        score, reasons = score_candidate(
+            candidate,
+            motion_profile,
+            args.preset,
+            args.motion_min_cpm,
+            args.boundary_guard_cpm,
+        )
         scored.append({**candidate, "score": score, "score_reasons": reasons})
-    groups = combine_scored_candidates(scored, args.preset)
-    final = select_final_candidate(groups)
+    groups = combine_scored_candidates(scored, args.preset, args.boundary_guard_cpm)
+    final = choose_window_final(groups, legacy_candidates, legacy_curves["carrier_energy_ratio"], args)
 
     make_series_svg(window_signal, out_dir / f"{prefix}_analysis_signal.svg", 1200, 260, f"{prefix} VPU analysis signal")
     make_series_svg(direct_curve, out_dir / f"{prefix}_direct_curve.svg", 1200, 260, f"{prefix} direct respiration curve")
@@ -836,6 +1096,13 @@ def analyze_window(
         1200,
         260,
         f"{prefix} carrier Hilbert-envelope respiration curve",
+    )
+    make_series_svg(
+        legacy_envelope_curve,
+        out_dir / f"{prefix}_stationary_legacy_envelope_curve.svg",
+        1200,
+        260,
+        f"{prefix} stationary legacy Hilbert-envelope curve",
     )
     make_series_svg(aggregate, out_dir / f"{prefix}_ssa_aggregate.svg", 1200, 260, f"{prefix} retained SSA aggregate")
     make_rate_spectrum_svg(
@@ -861,6 +1128,14 @@ def analyze_window(
         320,
         f"{prefix} carrier envelope CPM spectrum",
         carrier_dft.get("candidate_bpm"),
+    )
+    make_rate_spectrum_svg(
+        legacy_dft.get("spectrum", []),
+        out_dir / f"{prefix}_stationary_legacy_envelope_dft_spectrum.svg",
+        1200,
+        320,
+        f"{prefix} stationary legacy envelope CPM spectrum",
+        legacy_dft.get("candidate_bpm"),
     )
     make_rate_spectrum_svg(
         motion_profile["dft_estimate"].get("spectrum", []),
@@ -911,6 +1186,17 @@ def analyze_window(
                 "autocorr_estimate": carrier_autocorr,
                 "peak_count_estimate": carrier_peak_count,
             },
+            "stationary_legacy_envelope": {
+                "method": "legacy_hilbert_envelope_matching_extract_stationary_hr",
+                "bandpass_low_hz": legacy_curves["carrier_envelope_low_hz"],
+                "bandpass_high_hz": legacy_curves["carrier_envelope_high_hz"],
+                "carrier_energy_ratio": legacy_curves["carrier_energy_ratio"],
+                "carrier_min_energy_ratio": args.carrier_min_energy_ratio,
+                "curve_rate_hz": legacy_curve_rate,
+                "dft_estimate": legacy_dft,
+                "autocorr_estimate": legacy_autocorr,
+                "peak_count_estimate": legacy_peak_count,
+            },
             "ssa": {
                 "embedding_window_samples": ssa_window,
                 "embedding_window_seconds": ssa_window / curve_rate,
@@ -929,9 +1215,11 @@ def analyze_window(
             "direct_curve_svg": f"{prefix}_direct_curve.svg",
             "envelope_curve_svg": f"{prefix}_envelope_curve.svg",
             "carrier_envelope_curve_svg": f"{prefix}_carrier_envelope_curve.svg",
+            "stationary_legacy_envelope_curve_svg": f"{prefix}_stationary_legacy_envelope_curve.svg",
             "direct_dft_spectrum_svg": f"{prefix}_direct_dft_spectrum.svg",
             "envelope_dft_spectrum_svg": f"{prefix}_envelope_dft_spectrum.svg",
             "carrier_envelope_dft_spectrum_svg": f"{prefix}_carrier_envelope_dft_spectrum.svg",
+            "stationary_legacy_envelope_dft_spectrum_svg": f"{prefix}_stationary_legacy_envelope_dft_spectrum.svg",
             "motion_spectrum_svg": f"{prefix}_motion_spectrum.svg",
             "ssa_aggregate_svg": f"{prefix}_ssa_aggregate.svg",
             "ssa_aggregate_spectrum_svg": f"{prefix}_ssa_aggregate_spectrum.svg",
@@ -1094,7 +1382,13 @@ def choose_file_prediction(windows: list[dict]) -> dict:
                 "windows": [],
             }
             groups.append(target_group)
-        source_bonus = 0.6 if "direct" in selected_sources else 0.0
+        source_bonus = 0.0
+        if "direct" in selected_sources:
+            source_bonus += 0.6
+        if "stationary_legacy_envelope" in selected_sources:
+            source_bonus += 0.8
+        if "carrier_envelope" in selected_sources:
+            source_bonus += 0.4
         support_bonus = 0.2 * max(len(selected_sources) - 1, 0)
         weight = max(confidence, 0.05)
         target_group["score"] += weight + source_bonus + support_bonus
@@ -1135,6 +1429,7 @@ def choose_file_prediction(windows: list[dict]) -> dict:
 def compact_window_prediction(window: dict) -> dict:
     estimate = window["final_estimate"]
     selected_group = estimate.get("selected_group") or {}
+    branches = window.get("branches", {})
     return {
         "window_index": window["window_index"],
         "start_seconds": window["start_seconds"],
@@ -1143,7 +1438,14 @@ def compact_window_prediction(window: dict) -> dict:
         "rr_cpm": estimate.get("rr_cpm"),
         "confidence": estimate.get("confidence"),
         "reject_reason": estimate.get("reject_reason"),
+        "selection_policy": estimate.get("selection_policy"),
         "selected_sources": selected_group.get("support_sources", []),
+        "direct_dft_cpm": branches.get("direct", {}).get("dft_estimate", {}).get("candidate_bpm"),
+        "envelope_dft_cpm": branches.get("envelope", {}).get("dft_estimate", {}).get("candidate_bpm"),
+        "carrier_envelope_dft_cpm": branches.get("carrier_envelope", {}).get("dft_estimate", {}).get("candidate_bpm"),
+        "stationary_legacy_envelope_dft_cpm": branches.get("stationary_legacy_envelope", {})
+        .get("dft_estimate", {})
+        .get("candidate_bpm"),
         "expected_cpm": estimate.get("expected_cpm"),
         "error_vs_expected_cpm": estimate.get("error_vs_expected_cpm"),
     }
@@ -1158,7 +1460,12 @@ def write_window_predictions_csv(windows: list[dict], out_path: Path) -> None:
         "rr_cpm",
         "confidence",
         "reject_reason",
+        "selection_policy",
         "selected_sources",
+        "direct_dft_cpm",
+        "envelope_dft_cpm",
+        "carrier_envelope_dft_cpm",
+        "stationary_legacy_envelope_dft_cpm",
         "expected_cpm",
         "error_vs_expected_cpm",
     ]
@@ -1179,6 +1486,10 @@ def main() -> None:
         raise SystemExit("--cpm-max must be greater than --cpm-min.")
     if args.analysis_mode == "windows" and (args.window_seconds <= 0.0 or args.hop_seconds <= 0.0):
         raise SystemExit("--window-seconds and --hop-seconds must be positive.")
+    if args.legacy_envelope_rate <= 0.0:
+        raise SystemExit("--legacy-envelope-rate must be positive.")
+    if args.boundary_guard_cpm < 0.0:
+        raise SystemExit("--boundary-guard-cpm must be non-negative.")
 
     out_dir = args.output_dir / args.wav_path.stem / "vpu_respiration"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1219,7 +1530,7 @@ def main() -> None:
         "file_name": args.wav_path.name,
         "metadata": metadata,
         "vpu_respiration": {
-            "method": "respear_inspired_motion_aware_ssa",
+            "method": "vpu_stationary_legacy_envelope_or_motion_aware_ssa",
             "analysis_rate_hz": analysis_rate,
             "respiration_curve_rate_hz": args.respiration_rate,
             "cpm_search_min": args.cpm_min,
@@ -1228,6 +1539,9 @@ def main() -> None:
             "window_seconds": args.window_seconds,
             "hop_seconds": args.hop_seconds,
             "preset": args.preset,
+            "selection_policy": args.selection_policy,
+            "boundary_guard_cpm": args.boundary_guard_cpm,
+            "legacy_envelope_rate_hz": args.legacy_envelope_rate,
             "expected_cpm": args.expected_cpm,
             "file_prediction": file_prediction,
             "overall": summarize_overall(window_results),
@@ -1240,8 +1554,9 @@ def main() -> None:
     }
     prediction = {
         "file_name": args.wav_path.name,
-        "method": "respear_inspired_motion_aware_ssa",
+        "method": "vpu_stationary_legacy_envelope_or_motion_aware_ssa",
         "preset": args.preset,
+        "selection_policy": args.selection_policy,
         "analysis_mode": args.analysis_mode,
         "expected_cpm": args.expected_cpm,
         "file_prediction": file_prediction,
