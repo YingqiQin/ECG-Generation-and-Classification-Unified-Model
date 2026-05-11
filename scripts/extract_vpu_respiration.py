@@ -14,6 +14,7 @@ analyzes full windows.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 from pathlib import Path
@@ -892,6 +893,123 @@ def summarize_overall(windows: list[dict]) -> dict:
     }
 
 
+def choose_file_prediction(windows: list[dict]) -> dict:
+    valid = [
+        window
+        for window in windows
+        if window["final_estimate"].get("rr_cpm") is not None and window["final_estimate"].get("status") == "valid"
+    ]
+    usable = valid or [
+        window for window in windows if window["final_estimate"].get("rr_cpm") is not None
+    ]
+    if not usable:
+        return {
+            "status": "rejected",
+            "rr_cpm": None,
+            "confidence": 0.0,
+            "basis": "no_window_candidate",
+            "valid_window_count": 0,
+            "total_window_count": len(windows),
+        }
+
+    groups: list[dict] = []
+    for window in usable:
+        estimate = window["final_estimate"]
+        selected_group = estimate.get("selected_group") or {}
+        selected_sources = selected_group.get("support_sources") or []
+        rr_cpm = estimate["rr_cpm"]
+        confidence = estimate.get("confidence", 0.0)
+        target_group = None
+        for group in groups:
+            if abs(rr_cpm - group["rr_cpm"]) <= 3.0:
+                target_group = group
+                break
+        if target_group is None:
+            target_group = {
+                "rr_cpm": rr_cpm,
+                "score": 0.0,
+                "weighted_sum": 0.0,
+                "weight_total": 0.0,
+                "windows": [],
+            }
+            groups.append(target_group)
+        source_bonus = 0.6 if "direct" in selected_sources else 0.0
+        support_bonus = 0.2 * max(len(selected_sources) - 1, 0)
+        weight = max(confidence, 0.05)
+        target_group["score"] += weight + source_bonus + support_bonus
+        target_group["weighted_sum"] += rr_cpm * weight
+        target_group["weight_total"] += weight
+        target_group["windows"].append(window["window_index"])
+
+    for group in groups:
+        if group["weight_total"] > 0.0:
+            group["rr_cpm"] = group["weighted_sum"] / group["weight_total"]
+        del group["weighted_sum"]
+        del group["weight_total"]
+    groups.sort(key=lambda item: item["score"], reverse=True)
+    best_group = groups[0]
+    second_score = groups[1]["score"] if len(groups) > 1 else 0.0
+    margin = best_group["score"] - second_score
+    selected_windows = [window for window in usable if window["window_index"] in best_group["windows"]]
+    mean_confidence = sum(window["final_estimate"].get("confidence", 0.0) for window in selected_windows) / len(selected_windows)
+    if len(groups) > 1 and margin < 0.5:
+        mean_confidence = min(mean_confidence, 0.45)
+    status = "valid" if valid else "low_confidence"
+    if len(groups) > 1 and margin < 0.5:
+        status = "low_confidence"
+    return {
+        "status": status,
+        "rr_cpm": best_group["rr_cpm"],
+        "confidence": mean_confidence,
+        "basis": "best_consensus_window_group" if valid else "best_consensus_candidate_window_group",
+        "valid_window_count": len(valid),
+        "candidate_window_count": len(usable),
+        "total_window_count": len(windows),
+        "selected_window_indexes": best_group["windows"],
+        "window_group_count": len(groups),
+        "window_group_margin": margin,
+    }
+
+
+def compact_window_prediction(window: dict) -> dict:
+    estimate = window["final_estimate"]
+    selected_group = estimate.get("selected_group") or {}
+    return {
+        "window_index": window["window_index"],
+        "start_seconds": window["start_seconds"],
+        "end_seconds": window["end_seconds"],
+        "status": estimate.get("status"),
+        "rr_cpm": estimate.get("rr_cpm"),
+        "confidence": estimate.get("confidence"),
+        "reject_reason": estimate.get("reject_reason"),
+        "selected_sources": selected_group.get("support_sources", []),
+        "expected_cpm": estimate.get("expected_cpm"),
+        "error_vs_expected_cpm": estimate.get("error_vs_expected_cpm"),
+    }
+
+
+def write_window_predictions_csv(windows: list[dict], out_path: Path) -> None:
+    fieldnames = [
+        "window_index",
+        "start_seconds",
+        "end_seconds",
+        "status",
+        "rr_cpm",
+        "confidence",
+        "reject_reason",
+        "selected_sources",
+        "expected_cpm",
+        "error_vs_expected_cpm",
+    ]
+    with out_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for window in windows:
+            row = compact_window_prediction(window)
+            row["selected_sources"] = "+".join(row["selected_sources"])
+            writer.writerow(row)
+
+
 def main() -> None:
     args = parse_args()
     if args.cpm_min <= 0.0:
@@ -927,6 +1045,8 @@ def main() -> None:
         )
 
     make_trend_svg(window_results, out_dir / "rr_trend.svg", args.expected_cpm)
+    file_prediction = choose_file_prediction(window_results)
+    compact_windows = [compact_window_prediction(window) for window in window_results]
 
     summary = {
         "file_name": args.wav_path.name,
@@ -941,6 +1061,7 @@ def main() -> None:
             "hop_seconds": args.hop_seconds,
             "preset": args.preset,
             "expected_cpm": args.expected_cpm,
+            "file_prediction": file_prediction,
             "overall": summarize_overall(window_results),
             "windows": window_results,
             "artifacts": {
@@ -949,9 +1070,36 @@ def main() -> None:
             },
         },
     }
+    prediction = {
+        "file_name": args.wav_path.name,
+        "method": "respear_inspired_motion_aware_ssa",
+        "preset": args.preset,
+        "expected_cpm": args.expected_cpm,
+        "file_prediction": file_prediction,
+        "windows": compact_windows,
+        "artifacts": {
+            "full_summary_json": "summary.json",
+            "window_predictions_csv": "window_predictions.csv",
+            "rr_trend_svg": "rr_trend.svg",
+        },
+    }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    (out_dir / "prediction.json").write_text(json.dumps(prediction, indent=2, sort_keys=True), encoding="utf-8")
+    write_window_predictions_csv(window_results, out_dir / "window_predictions.csv")
     print(f"Saved VPU respiration summary to {out_dir / 'summary.json'}")
+    print(f"Saved compact prediction to {out_dir / 'prediction.json'}")
+    print(f"Saved window prediction table to {out_dir / 'window_predictions.csv'}")
     print(f"Saved VPU respiration trend to {out_dir / 'rr_trend.svg'}")
+    if file_prediction["rr_cpm"] is None:
+        print("FINAL_RR_CPM rejected confidence=0.000")
+    else:
+        print(
+            "FINAL_RR_CPM "
+            f"{file_prediction['rr_cpm']:.2f} "
+            f"status={file_prediction['status']} "
+            f"confidence={file_prediction['confidence']:.3f} "
+            f"valid_windows={file_prediction['valid_window_count']}/{file_prediction['total_window_count']}"
+        )
 
 
 if __name__ == "__main__":
