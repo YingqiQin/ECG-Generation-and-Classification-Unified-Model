@@ -105,6 +105,12 @@ def parse_args() -> argparse.Namespace:
         help="Optional reference CPM for evaluation only; not used for selecting the prediction",
     )
     parser.add_argument(
+        "--selection-mode",
+        choices=["max_peak", "candidate_ranker"],
+        default="candidate_ranker",
+        help="Use the maximum DFT peak directly, or rank competing peaks with stability evidence",
+    )
+    parser.add_argument(
         "--competitive-peak-ratio",
         type=float,
         default=0.75,
@@ -128,6 +134,42 @@ def parse_args() -> argparse.Namespace:
         default=1.25,
         help="Minimum top/runner-up DFT peak power ratio required for motion captures",
     )
+    parser.add_argument(
+        "--ranker-max-candidates",
+        type=int,
+        default=5,
+        help="Maximum separated DFT peak candidates to score in candidate_ranker mode",
+    )
+    parser.add_argument(
+        "--ranker-min-score",
+        type=float,
+        default=0.50,
+        help="Minimum evidence score required for candidate_ranker to output a valid CPM",
+    )
+    parser.add_argument(
+        "--ranker-score-margin",
+        type=float,
+        default=0.08,
+        help="Minimum score gap between the best and runner-up ranked candidate",
+    )
+    parser.add_argument(
+        "--candidate-tolerance-cpm",
+        type=float,
+        default=2.5,
+        help="Tolerance for treating supporting peaks as matching a candidate CPM",
+    )
+    parser.add_argument(
+        "--subwindow-seconds",
+        type=float,
+        default=20.0,
+        help="Internal subwindow length for candidate stability checks",
+    )
+    parser.add_argument(
+        "--subwindow-hop-seconds",
+        type=float,
+        default=10.0,
+        help="Internal subwindow hop for candidate stability checks",
+    )
     return parser.parse_args()
 
 
@@ -149,6 +191,12 @@ def resolve_cpm_bounds(args: argparse.Namespace) -> tuple[float, float, str]:
     if cpm_max <= cpm_min:
         raise SystemExit("--cpm-max must be greater than --cpm-min.")
     return cpm_min, cpm_max, source
+
+
+def rms(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return (sum(value * value for value in values) / len(values)) ** 0.5
 
 
 def summarize_dft_peaks(
@@ -265,28 +313,13 @@ def make_cpm_spectrum_svg(
     out_path.write_text(svg, encoding="utf-8")
 
 
-def build_vpu_envelope_baseline(
+def extract_envelope_curve(
     analysis_signal: list[float],
     analysis_rate: float,
     envelope_rate_target: float,
     carrier_low_hz: float,
     carrier_high_hz: float,
-    cpm_min: float,
-    cpm_max: float,
-    condition: str,
-    competitive_peak_ratio: float,
-    peak_merge_cpm: float,
-    stationary_min_peak_dominance: float,
-    motion_min_peak_dominance: float,
-    out_dir: Path,
-    fragment_seconds: float,
 ) -> dict:
-    """Extract VPU breath CPM from a carrier-band Hilbert envelope.
-
-    Input shape: mono analysis signal `[time]`, already centered and decimated.
-    The operation is non-causal and uses a DFT search over the full envelope
-    curve. Output rates are cycles per minute.
-    """
     taps = make_bandpass_fir(analysis_rate, carrier_low_hz, carrier_high_hz, num_taps=129)
     bandpassed = fir_filter(analysis_signal, taps)
     analytic = analytic_signal(bandpassed)
@@ -300,6 +333,230 @@ def build_vpu_envelope_baseline(
     breath_curve = [value - trend for value, trend in zip(envelope_smooth, slow_trend)]
     breath_curve = moving_average(breath_curve, max(int(envelope_rate * 0.30), 1))
 
+    return {
+        "bandpassed": bandpassed,
+        "hilbert_envelope": hilbert_envelope,
+        "envelope_ds": envelope_ds,
+        "breath_curve": breath_curve,
+        "envelope_rate_hz": envelope_rate,
+        "band_rms": rms(bandpassed),
+    }
+
+
+def relative_power_at_cpm(dft_estimate: dict, candidate_cpm: float) -> float:
+    spectrum = dft_estimate.get("spectrum") or []
+    if not spectrum:
+        return 0.0
+    max_power = max(item["power"] for item in spectrum) or 1e-12
+    closest = min(spectrum, key=lambda item: abs(item["bpm"] - candidate_cpm))
+    return closest["power"] / max_power
+
+
+def build_carrier_subbands(carrier_low_hz: float, carrier_high_hz: float) -> list[tuple[float, float]]:
+    span = carrier_high_hz - carrier_low_hz
+    if span < 9.0:
+        return [(carrier_low_hz, carrier_high_hz)]
+    step = span / 3.0
+    return [
+        (carrier_low_hz, carrier_low_hz + step),
+        (carrier_low_hz + step, carrier_low_hz + 2.0 * step),
+        (carrier_low_hz + 2.0 * step, carrier_high_hz),
+    ]
+
+
+def build_band_profiles(
+    analysis_signal: list[float],
+    analysis_rate: float,
+    envelope_rate_target: float,
+    carrier_low_hz: float,
+    carrier_high_hz: float,
+    cpm_min: float,
+    cpm_max: float,
+    energy_ratio_min: float = 0.03,
+) -> list[dict]:
+    full_rms = max(rms(analysis_signal), 1e-12)
+    profiles = []
+    for low_hz, high_hz in build_carrier_subbands(carrier_low_hz, carrier_high_hz):
+        if high_hz <= low_hz:
+            continue
+        curve = extract_envelope_curve(analysis_signal, analysis_rate, envelope_rate_target, low_hz, high_hz)
+        energy_ratio = curve["band_rms"] / full_rms
+        if energy_ratio < energy_ratio_min:
+            continue
+        dft = estimate_dft_bpm(curve["breath_curve"], curve["envelope_rate_hz"], bpm_min=cpm_min, bpm_max=cpm_max)
+        profiles.append(
+            {
+                "band_low_hz": low_hz,
+                "band_high_hz": high_hz,
+                "energy_ratio": energy_ratio,
+                "dft_estimate": dft,
+            }
+        )
+    return profiles
+
+
+def build_subwindow_profiles(
+    breath_curve: list[float],
+    envelope_rate_hz: float,
+    cpm_min: float,
+    cpm_max: float,
+    subwindow_seconds: float,
+    subwindow_hop_seconds: float,
+) -> list[dict]:
+    window_len = max(int(subwindow_seconds * envelope_rate_hz), 1)
+    hop_len = max(int(subwindow_hop_seconds * envelope_rate_hz), 1)
+    if len(breath_curve) < window_len or window_len < max(int(envelope_rate_hz * 8.0), 1):
+        return []
+
+    profiles = []
+    start = 0
+    while start + window_len <= len(breath_curve):
+        chunk = breath_curve[start : start + window_len]
+        dft = estimate_dft_bpm(chunk, envelope_rate_hz, bpm_min=cpm_min, bpm_max=cpm_max)
+        profiles.append(
+            {
+                "start_seconds": start / envelope_rate_hz,
+                "end_seconds": (start + window_len) / envelope_rate_hz,
+                "dft_estimate": dft,
+            }
+        )
+        start += hop_len
+    return profiles
+
+
+def summarize_candidate_support(
+    profiles: list[dict],
+    candidate_cpm: float,
+    support_threshold: float,
+) -> dict:
+    if not profiles:
+        return {
+            "support_count": 0,
+            "profile_count": 0,
+            "support_fraction": 0.5,
+            "mean_relative_power": 0.5,
+            "relative_powers": [],
+        }
+    relative_powers = [relative_power_at_cpm(profile["dft_estimate"], candidate_cpm) for profile in profiles]
+    support_count = sum(1 for value in relative_powers if value >= support_threshold)
+    return {
+        "support_count": support_count,
+        "profile_count": len(profiles),
+        "support_fraction": support_count / len(profiles),
+        "mean_relative_power": sum(relative_powers) / len(relative_powers),
+        "relative_powers": relative_powers,
+    }
+
+
+def rank_dft_candidates(
+    peak_summary: dict,
+    autocorr_estimate: dict,
+    band_profiles: list[dict],
+    subwindow_profiles: list[dict],
+    cpm_min: float,
+    condition: str,
+    candidate_tolerance_cpm: float,
+    max_candidates: int,
+) -> list[dict]:
+    peaks = peak_summary.get("peaks") or []
+    candidates = peaks[:max_candidates]
+    ranked = []
+    autocorr_cpm = autocorr_estimate.get("candidate_bpm")
+    for candidate in candidates:
+        cpm = candidate["bpm"]
+        relative_power = candidate.get("relative_power", 0.0)
+        band_support = summarize_candidate_support(band_profiles, cpm, support_threshold=0.50)
+        subwindow_support = summarize_candidate_support(subwindow_profiles, cpm, support_threshold=0.45)
+        autocorr_score = 0.0
+        if autocorr_cpm is not None:
+            autocorr_delta = abs(cpm - autocorr_cpm)
+            autocorr_score = max(0.0, 1.0 - autocorr_delta / max(candidate_tolerance_cpm * 2.0, 1e-9))
+        else:
+            autocorr_delta = None
+
+        boundary_distance = cpm - cpm_min
+        boundary_penalty = 0.0
+        evidence: list[str] = []
+        if relative_power >= 0.90:
+            evidence.append("high_fullband_power")
+        if band_support["support_fraction"] >= 0.67:
+            evidence.append("carrier_band_stable")
+        if subwindow_support["support_fraction"] >= 0.60:
+            evidence.append("subwindow_stable")
+        if autocorr_score >= 0.60:
+            evidence.append("autocorr_agrees")
+        if boundary_distance < 2.0:
+            boundary_penalty = 0.12 if condition in MOTION_CONDITIONS else 0.08
+            evidence.append("near_cpm_min_penalty")
+
+        score = (
+            0.15 * relative_power
+            + 0.45 * band_support["support_fraction"]
+            + 0.25 * band_support["mean_relative_power"]
+            + 0.05 * subwindow_support["support_fraction"]
+            + 0.10 * autocorr_score
+            - boundary_penalty
+        )
+        ranked.append(
+            {
+                "cpm": cpm,
+                "score": max(0.0, min(1.0, score)),
+                "source_rank": candidate.get("rank"),
+                "relative_power": relative_power,
+                "band_support": band_support,
+                "subwindow_support": subwindow_support,
+                "autocorr_delta_cpm": autocorr_delta,
+                "boundary_distance_cpm": boundary_distance,
+                "evidence": evidence,
+            }
+        )
+
+    ranked.sort(key=lambda item: item["score"], reverse=True)
+    return ranked
+
+
+def build_vpu_envelope_baseline(
+    analysis_signal: list[float],
+    analysis_rate: float,
+    envelope_rate_target: float,
+    carrier_low_hz: float,
+    carrier_high_hz: float,
+    cpm_min: float,
+    cpm_max: float,
+    condition: str,
+    selection_mode: str,
+    competitive_peak_ratio: float,
+    peak_merge_cpm: float,
+    stationary_min_peak_dominance: float,
+    motion_min_peak_dominance: float,
+    ranker_max_candidates: int,
+    ranker_min_score: float,
+    ranker_score_margin: float,
+    candidate_tolerance_cpm: float,
+    subwindow_seconds: float,
+    subwindow_hop_seconds: float,
+    out_dir: Path,
+    fragment_seconds: float,
+) -> dict:
+    """Extract VPU breath CPM from a carrier-band Hilbert envelope.
+
+    Input shape: mono analysis signal `[time]`, already centered and decimated.
+    The operation is non-causal and uses a DFT search over the full envelope
+    curve. Output rates are cycles per minute.
+    """
+    curve_bundle = extract_envelope_curve(
+        analysis_signal,
+        analysis_rate,
+        envelope_rate_target,
+        carrier_low_hz,
+        carrier_high_hz,
+    )
+    bandpassed = curve_bundle["bandpassed"]
+    hilbert_envelope = curve_bundle["hilbert_envelope"]
+    envelope_ds = curve_bundle["envelope_ds"]
+    breath_curve = curve_bundle["breath_curve"]
+    envelope_rate = curve_bundle["envelope_rate_hz"]
+
     autocorr_est = estimate_autocorr_bpm(breath_curve, envelope_rate, bpm_min=cpm_min, bpm_max=cpm_max)
     dft_est = estimate_dft_bpm(breath_curve, envelope_rate, bpm_min=cpm_min, bpm_max=cpm_max)
     peak_summary = summarize_dft_peaks(dft_est, competitive_peak_ratio, peak_merge_cpm)
@@ -308,16 +565,77 @@ def build_vpu_envelope_baseline(
     autocorr_cpm = autocorr_est.get("candidate_bpm")
     autocorr_delta = abs(dft_cpm - autocorr_cpm) if dft_cpm is not None and autocorr_cpm is not None else None
 
+    candidate_ranking: list[dict] = []
+    band_profiles: list[dict] = []
+    subwindow_profiles: list[dict] = []
+    selected_cpm = dft_cpm
+    selected_by = "max_peak"
     confidence = min(1.0, 0.35 + 0.18 * min(dominance, 3.0))
     status = "valid"
     warnings: list[str] = []
     min_required_dominance = motion_min_peak_dominance if condition in MOTION_CONDITIONS else stationary_min_peak_dominance
     if dft_cpm is None:
         status = "rejected"
+        selected_cpm = None
         confidence = 0.0
         warnings.append("no_dft_candidate")
+    elif selection_mode == "candidate_ranker":
+        band_profiles = build_band_profiles(
+            analysis_signal,
+            analysis_rate,
+            envelope_rate_target,
+            carrier_low_hz,
+            carrier_high_hz,
+            cpm_min,
+            cpm_max,
+        )
+        subwindow_profiles = build_subwindow_profiles(
+            breath_curve,
+            envelope_rate,
+            cpm_min,
+            cpm_max,
+            subwindow_seconds,
+            subwindow_hop_seconds,
+        )
+        candidate_ranking = rank_dft_candidates(
+            peak_summary,
+            autocorr_est,
+            band_profiles,
+            subwindow_profiles,
+            cpm_min,
+            condition,
+            candidate_tolerance_cpm,
+            ranker_max_candidates,
+        )
+        if not candidate_ranking:
+            status = "rejected"
+            selected_cpm = None
+            confidence = 0.0
+            warnings.append("no_rankable_candidate")
+        else:
+            best = candidate_ranking[0]
+            runner_up = candidate_ranking[1] if len(candidate_ranking) > 1 else None
+            margin = best["score"] - (runner_up["score"] if runner_up else 0.0)
+            selected_cpm = best["cpm"]
+            selected_by = "candidate_ranker"
+            confidence = min(1.0, 0.30 + 0.55 * best["score"] + 0.20 * max(margin, 0.0))
+            if best["score"] < ranker_min_score:
+                status = "ambiguous"
+                selected_cpm = None
+                confidence = min(confidence, 0.42)
+                warnings.append("candidate_ranker_low_score")
+            elif runner_up is not None and margin < ranker_score_margin:
+                status = "ambiguous"
+                selected_cpm = None
+                confidence = min(confidence, 0.45)
+                warnings.append("candidate_ranker_small_margin")
+            elif peak_summary["competitive_peak_count"] > 1:
+                warnings.append("resolved_competing_dft_peaks_with_candidate_ranker")
+            if status == "valid" and dft_cpm is not None and abs(best["cpm"] - dft_cpm) > candidate_tolerance_cpm:
+                warnings.append("selected_non_top_candidate_with_candidate_ranker")
     elif peak_summary["competitive_peak_count"] > 1 and dominance < min_required_dominance:
         status = "ambiguous"
+        selected_cpm = None
         confidence = min(confidence, 0.40)
         warnings.append("multiple_competing_dft_peaks")
         if condition in MOTION_CONDITIONS:
@@ -331,6 +649,7 @@ def build_vpu_envelope_baseline(
         warnings.append("autocorr_disagrees_with_dft")
         confidence = min(confidence, 0.72)
     if status == "ambiguous":
+        selected_cpm = None
         confidence = min(confidence, 0.45)
 
     make_series_svg(bandpassed, out_dir / "vpu_carrier_bandpassed_waveform.svg", 1200, 280, "VPU carrier-band waveform")
@@ -368,6 +687,27 @@ def build_vpu_envelope_baseline(
         "autocorr_estimate": autocorr_est,
         "dft_peak_dominance_ratio": dominance,
         "dft_peak_summary": peak_summary,
+        "selection_mode": selection_mode,
+        "selected_by": selected_by,
+        "selected_cpm": selected_cpm,
+        "candidate_ranking": candidate_ranking,
+        "band_profiles": [
+            {
+                "band_low_hz": profile["band_low_hz"],
+                "band_high_hz": profile["band_high_hz"],
+                "energy_ratio": profile["energy_ratio"],
+                "candidate_cpm": profile["dft_estimate"].get("candidate_bpm"),
+            }
+            for profile in band_profiles
+        ],
+        "subwindow_profiles": [
+            {
+                "start_seconds": profile["start_seconds"],
+                "end_seconds": profile["end_seconds"],
+                "candidate_cpm": profile["dft_estimate"].get("candidate_bpm"),
+            }
+            for profile in subwindow_profiles
+        ],
         "min_required_peak_dominance_ratio": min_required_dominance,
         "autocorr_delta_cpm": autocorr_delta,
         "status": status,
@@ -397,6 +737,16 @@ def main() -> None:
         raise SystemExit("--peak-merge-cpm must be positive.")
     if args.stationary_min_peak_dominance < 1.0 or args.motion_min_peak_dominance < 1.0:
         raise SystemExit("--stationary-min-peak-dominance and --motion-min-peak-dominance must be at least 1.")
+    if args.ranker_max_candidates <= 0:
+        raise SystemExit("--ranker-max-candidates must be positive.")
+    if not (0.0 <= args.ranker_min_score <= 1.0):
+        raise SystemExit("--ranker-min-score must be in [0, 1].")
+    if args.ranker_score_margin < 0.0:
+        raise SystemExit("--ranker-score-margin must be non-negative.")
+    if args.candidate_tolerance_cpm <= 0.0:
+        raise SystemExit("--candidate-tolerance-cpm must be positive.")
+    if args.subwindow_seconds <= 0.0 or args.subwindow_hop_seconds <= 0.0:
+        raise SystemExit("--subwindow-seconds and --subwindow-hop-seconds must be positive.")
 
     cpm_min, cpm_max, cpm_bound_source = resolve_cpm_bounds(args)
     if not (0.0 < args.carrier_low_hz < args.carrier_high_hz):
@@ -424,30 +774,41 @@ def main() -> None:
         cpm_min,
         cpm_max,
         args.condition,
+        args.selection_mode,
         args.competitive_peak_ratio,
         args.peak_merge_cpm,
         args.stationary_min_peak_dominance,
         args.motion_min_peak_dominance,
+        args.ranker_max_candidates,
+        args.ranker_min_score,
+        args.ranker_score_margin,
+        args.candidate_tolerance_cpm,
+        args.subwindow_seconds,
+        args.subwindow_hop_seconds,
         out_dir,
         args.fragment_seconds,
     )
 
-    predicted_cpm = baseline["dft_estimate"].get("candidate_bpm")
-    final_breath_cpm = predicted_cpm if baseline["status"] == "valid" else None
+    top_candidate_cpm = baseline["dft_estimate"].get("candidate_bpm")
+    selected_candidate_cpm = baseline["selected_cpm"]
+    final_breath_cpm = selected_candidate_cpm if baseline["status"] == "valid" else None
     error_vs_expected = (
         final_breath_cpm - args.expected_cpm
         if final_breath_cpm is not None and args.expected_cpm is not None
         else None
     )
     top_candidate_error_vs_expected = (
-        predicted_cpm - args.expected_cpm
-        if predicted_cpm is not None and args.expected_cpm is not None
+        top_candidate_cpm - args.expected_cpm
+        if top_candidate_cpm is not None and args.expected_cpm is not None
         else None
     )
     final_prediction = {
         "status": baseline["status"],
         "breath_cpm": final_breath_cpm,
-        "top_candidate_cpm": predicted_cpm,
+        "selected_candidate_cpm": selected_candidate_cpm,
+        "top_candidate_cpm": top_candidate_cpm,
+        "selected_by": baseline["selected_by"],
+        "selection_mode": args.selection_mode,
         "confidence": baseline["confidence"],
         "condition": args.condition,
         "cpm_bound_source": cpm_bound_source,
@@ -458,6 +819,7 @@ def main() -> None:
         "competitive_peak_count": baseline["dft_peak_summary"]["competitive_peak_count"],
         "competitive_peaks": baseline["dft_peak_summary"]["competitive_peaks"],
         "top_peaks": baseline["dft_peak_summary"]["peaks"],
+        "candidate_ranking": baseline["candidate_ranking"],
         "autocorr_cpm": baseline["autocorr_estimate"].get("candidate_bpm"),
         "autocorr_delta_cpm": baseline["autocorr_delta_cpm"],
         "expected_cpm": args.expected_cpm,
@@ -473,6 +835,7 @@ def main() -> None:
             "method": "vpu_carrier_hilbert_envelope_dft_baseline",
             "analysis_sample_rate_hz": analysis_rate,
             "condition": args.condition,
+            "selection_mode": args.selection_mode,
             "cpm_bound_source": cpm_bound_source,
             "condition_presets": CONDITION_PRESETS,
             "expected_cpm": args.expected_cpm,
@@ -500,26 +863,31 @@ def main() -> None:
 
     print(f"Saved VPU envelope baseline summary to {out_dir / 'summary.json'}")
     print(f"Saved compact prediction to {out_dir / 'prediction.json'}")
-    if predicted_cpm is None:
+    if top_candidate_cpm is None:
         print("FINAL_VPU_CPM rejected confidence=0.000")
     elif baseline["status"] == "ambiguous":
         candidates = ",".join(f"{peak['bpm']:.1f}" for peak in baseline["dft_peak_summary"]["competitive_peaks"])
         print(
             "FINAL_VPU_CPM ambiguous "
-            f"top_candidate={predicted_cpm:.2f} "
+            f"top_candidate={top_candidate_cpm:.2f} "
             f"confidence={baseline['confidence']:.3f} "
             f"condition={args.condition} "
             f"range={cpm_min:.1f}-{cpm_max:.1f} "
             f"competitive_candidates={candidates}"
         )
     else:
+        selected_note = ""
+        if selected_candidate_cpm is not None and abs(selected_candidate_cpm - top_candidate_cpm) > 1e-9:
+            selected_note = f" top_candidate={top_candidate_cpm:.2f}"
         print(
             "FINAL_VPU_CPM "
-            f"{predicted_cpm:.2f} "
+            f"{selected_candidate_cpm:.2f} "
             f"status={baseline['status']} "
             f"confidence={baseline['confidence']:.3f} "
             f"condition={args.condition} "
-            f"range={cpm_min:.1f}-{cpm_max:.1f}"
+            f"range={cpm_min:.1f}-{cpm_max:.1f} "
+            f"selected_by={baseline['selected_by']}"
+            f"{selected_note}"
         )
 
 
