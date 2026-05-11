@@ -20,6 +20,7 @@ import math
 from pathlib import Path
 
 from extract_stationary_hr import (
+    analytic_signal,
     centered,
     decimate_mean,
     estimate_autocorr_bpm,
@@ -94,6 +95,24 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.70,
         help="Upper cutoff for direct respiration branch",
+    )
+    parser.add_argument(
+        "--carrier-envelope-low-hz",
+        type=float,
+        default=8.0,
+        help="Lower carrier bandpass cutoff for the stationary Hilbert envelope branch",
+    )
+    parser.add_argument(
+        "--carrier-envelope-high-hz",
+        type=float,
+        default=40.0,
+        help="Upper carrier bandpass cutoff for the stationary Hilbert envelope branch",
+    )
+    parser.add_argument(
+        "--carrier-min-energy-ratio",
+        type=float,
+        default=0.03,
+        help="Minimum carrier-band RMS/raw RMS ratio required before using carrier envelope candidates",
     )
     parser.add_argument(
         "--motion-low-hz",
@@ -372,6 +391,8 @@ def build_respiration_curves(
     respiration_rate: float,
     low_hz: float,
     high_hz: float,
+    carrier_low_hz: float,
+    carrier_high_hz: float,
 ) -> dict:
     taps = make_bandpass_fir(analysis_rate, low_hz, high_hz, num_taps=257)
     direct_bandpassed = fir_filter(window_signal, taps)
@@ -387,10 +408,34 @@ def build_respiration_curves(
     envelope_curve = [value - trend for value, trend in zip(envelope_smooth, slow_trend)]
     envelope_curve = moving_average(envelope_curve, max(int(curve_rate * 0.50), 1))
 
+    carrier_bandpassed: list[float] = []
+    carrier_envelope_curve: list[float] = []
+    carrier_energy_ratio = 0.0
+    nyquist = analysis_rate / 2.0
+    safe_carrier_high = min(carrier_high_hz, nyquist * 0.90)
+    if 0.0 < carrier_low_hz < safe_carrier_high:
+        carrier_taps = make_bandpass_fir(analysis_rate, carrier_low_hz, safe_carrier_high, num_taps=129)
+        carrier_bandpassed = fir_filter(window_signal, carrier_taps)
+        carrier_energy_ratio = rms(carrier_bandpassed) / max(rms(window_signal), 1e-12)
+        carrier_analytic = analytic_signal(carrier_bandpassed)
+        carrier_envelope = [abs(value) for value in carrier_analytic]
+        carrier_envelope_ds = decimate_mean(carrier_envelope, stride)
+        carrier_envelope_smooth = moving_average(carrier_envelope_ds, max(int(curve_rate * 0.20), 1))
+        carrier_slow_trend = moving_average(carrier_envelope_smooth, max(int(curve_rate * 2.0), 1))
+        carrier_envelope_curve = [
+            value - trend for value, trend in zip(carrier_envelope_smooth, carrier_slow_trend)
+        ]
+        carrier_envelope_curve = moving_average(carrier_envelope_curve, max(int(curve_rate * 0.30), 1))
+
     return {
         "direct_bandpassed": direct_bandpassed,
         "direct_curve": direct_curve,
         "envelope_curve": envelope_curve,
+        "carrier_bandpassed": carrier_bandpassed,
+        "carrier_envelope_curve": carrier_envelope_curve,
+        "carrier_envelope_low_hz": carrier_low_hz,
+        "carrier_envelope_high_hz": safe_carrier_high,
+        "carrier_energy_ratio": carrier_energy_ratio,
         "curve_rate_hz": curve_rate,
     }
 
@@ -469,8 +514,26 @@ def score_candidate(candidate: dict, motion_profile: dict, preset: str, motion_m
     cpm = candidate["candidate_cpm"]
 
     if candidate["source"] == "direct":
-        score += 5.0
-        reasons.append("direct_vpu_support")
+        if preset == "motion":
+            score += 5.0
+            reasons.append("direct_vpu_motion_support")
+        elif preset == "stationary":
+            score += 5.0
+            reasons.append("direct_vpu_stationary_support")
+        elif preset == "auto":
+            score += 2.0
+            reasons.append("direct_vpu_auto_support")
+
+    if candidate["source"] == "carrier_envelope":
+        if preset == "stationary":
+            score += 10.0
+            reasons.append("carrier_envelope_stationary_support")
+        elif preset == "auto":
+            score += 2.0
+            reasons.append("carrier_envelope_auto_support")
+        else:
+            score += 1.0
+            reasons.append("carrier_envelope_support")
 
     autocorr_cpm = candidate.get("autocorr_cpm")
     autocorr_strength = candidate.get("autocorr_strength") or 0.0
@@ -520,6 +583,8 @@ def source_family(source: str) -> str:
         return "direct"
     if source == "envelope":
         return "envelope"
+    if source == "carrier_envelope":
+        return "carrier_envelope"
     if source == "ssa_aggregate":
         return "ssa_aggregate"
     if source.startswith("ssa_component"):
@@ -527,7 +592,7 @@ def source_family(source: str) -> str:
     return source
 
 
-def combine_scored_candidates(scored: list[dict], tolerance_cpm: float = 2.5) -> list[dict]:
+def combine_scored_candidates(scored: list[dict], preset: str, tolerance_cpm: float = 2.5) -> list[dict]:
     groups: list[dict] = []
     for candidate in sorted(scored, key=lambda item: item["score"], reverse=True):
         target_group = None
@@ -564,20 +629,23 @@ def combine_scored_candidates(scored: list[dict], tolerance_cpm: float = 2.5) ->
         del group["score_weighted_total"]
         del group["weight_total"]
 
-    direct_groups = [group for group in groups if "direct" in group.get("support_families", [])]
-    for group in groups:
-        if "direct" in group.get("support_families", []):
-            continue
-        for direct_group in direct_groups:
-            direct_cpm = direct_group["candidate_cpm"]
-            if abs(group["candidate_cpm"] - 2.0 * direct_cpm) <= tolerance_cpm:
-                group["combined_score"] -= 55.0
-                group["harmonic_penalty"] = "near_double_direct_candidate"
-                break
-            if 0.0 < group["candidate_cpm"] - direct_cpm <= tolerance_cpm * 2.0:
-                group["combined_score"] -= 8.0
-                group["harmonic_penalty"] = "near_upper_neighbor_of_direct_candidate"
-                break
+    if preset in {"stationary", "motion"}:
+        direct_groups = [group for group in groups if "direct" in group.get("support_families", [])]
+        for group in groups:
+            if "direct" in group.get("support_families", []):
+                continue
+            if preset == "stationary" and "carrier_envelope" in group.get("support_families", []):
+                continue
+            for direct_group in direct_groups:
+                direct_cpm = direct_group["candidate_cpm"]
+                if abs(group["candidate_cpm"] - 2.0 * direct_cpm) <= tolerance_cpm:
+                    group["combined_score"] -= 55.0
+                    group["harmonic_penalty"] = "near_double_direct_candidate"
+                    break
+                if preset == "motion" and 0.0 < group["candidate_cpm"] - direct_cpm <= tolerance_cpm * 2.0:
+                    group["combined_score"] -= 8.0
+                    group["harmonic_penalty"] = "near_upper_neighbor_of_direct_candidate"
+                    break
 
     groups.sort(key=lambda item: item["combined_score"], reverse=True)
     return groups
@@ -622,9 +690,12 @@ def analyze_window(
         args.respiration_rate,
         args.direct_low_hz,
         args.direct_high_hz,
+        args.carrier_envelope_low_hz,
+        args.carrier_envelope_high_hz,
     )
     direct_curve = curves["direct_curve"]
     envelope_curve = curves["envelope_curve"]
+    carrier_envelope_curve = curves["carrier_envelope_curve"]
     curve_rate = curves["curve_rate_hz"]
 
     motion_profile = inspect_motion(window_signal, analysis_rate, args.motion_low_hz, args.motion_high_hz)
@@ -642,6 +713,23 @@ def analyze_window(
         args.cpm_min,
         args.cpm_max,
     )
+    if curves["carrier_energy_ratio"] >= args.carrier_min_energy_ratio:
+        carrier_candidates, carrier_dft, carrier_autocorr, carrier_peak_count = dft_candidates_from_signal(
+            "carrier_envelope",
+            carrier_envelope_curve,
+            curve_rate,
+            args.cpm_min,
+            args.cpm_max,
+        )
+    else:
+        carrier_candidates = []
+        carrier_dft = {
+            "status": "skipped_low_carrier_energy",
+            "carrier_energy_ratio": curves["carrier_energy_ratio"],
+            "required_min_energy_ratio": args.carrier_min_energy_ratio,
+        }
+        carrier_autocorr = {"status": "skipped_low_carrier_energy"}
+        carrier_peak_count = {"status": "skipped_low_carrier_energy"}
 
     ssa_window = max(int(curve_rate * args.ssa_window_seconds), 8)
     ssa_window = min(ssa_window, 80)
@@ -706,17 +794,24 @@ def analyze_window(
             max_candidates=3,
         )
 
-    raw_candidates = direct_candidates + envelope_candidates + ssa_candidates + aggregate_candidates
+    raw_candidates = direct_candidates + envelope_candidates + carrier_candidates + ssa_candidates + aggregate_candidates
     scored: list[dict] = []
     for candidate in raw_candidates:
         score, reasons = score_candidate(candidate, motion_profile, args.preset, args.motion_min_cpm)
         scored.append({**candidate, "score": score, "score_reasons": reasons})
-    groups = combine_scored_candidates(scored)
+    groups = combine_scored_candidates(scored, args.preset)
     final = select_final_candidate(groups)
 
     make_series_svg(window_signal, out_dir / f"{prefix}_analysis_signal.svg", 1200, 260, f"{prefix} VPU analysis signal")
     make_series_svg(direct_curve, out_dir / f"{prefix}_direct_curve.svg", 1200, 260, f"{prefix} direct respiration curve")
     make_series_svg(envelope_curve, out_dir / f"{prefix}_envelope_curve.svg", 1200, 260, f"{prefix} envelope respiration curve")
+    make_series_svg(
+        carrier_envelope_curve,
+        out_dir / f"{prefix}_carrier_envelope_curve.svg",
+        1200,
+        260,
+        f"{prefix} carrier Hilbert-envelope respiration curve",
+    )
     make_series_svg(aggregate, out_dir / f"{prefix}_ssa_aggregate.svg", 1200, 260, f"{prefix} retained SSA aggregate")
     make_rate_spectrum_svg(
         direct_dft.get("spectrum", []),
@@ -733,6 +828,14 @@ def analyze_window(
         320,
         f"{prefix} envelope branch CPM spectrum",
         envelope_dft.get("candidate_bpm"),
+    )
+    make_rate_spectrum_svg(
+        carrier_dft.get("spectrum", []),
+        out_dir / f"{prefix}_carrier_envelope_dft_spectrum.svg",
+        1200,
+        320,
+        f"{prefix} carrier envelope CPM spectrum",
+        carrier_dft.get("candidate_bpm"),
     )
     make_rate_spectrum_svg(
         motion_profile["dft_estimate"].get("spectrum", []),
@@ -774,6 +877,15 @@ def analyze_window(
                 "autocorr_estimate": envelope_autocorr,
                 "peak_count_estimate": envelope_peak_count,
             },
+            "carrier_envelope": {
+                "bandpass_low_hz": curves["carrier_envelope_low_hz"],
+                "bandpass_high_hz": curves["carrier_envelope_high_hz"],
+                "carrier_energy_ratio": curves["carrier_energy_ratio"],
+                "carrier_min_energy_ratio": args.carrier_min_energy_ratio,
+                "dft_estimate": carrier_dft,
+                "autocorr_estimate": carrier_autocorr,
+                "peak_count_estimate": carrier_peak_count,
+            },
             "ssa": {
                 "embedding_window_samples": ssa_window,
                 "embedding_window_seconds": ssa_window / curve_rate,
@@ -791,8 +903,10 @@ def analyze_window(
             "analysis_signal_svg": f"{prefix}_analysis_signal.svg",
             "direct_curve_svg": f"{prefix}_direct_curve.svg",
             "envelope_curve_svg": f"{prefix}_envelope_curve.svg",
+            "carrier_envelope_curve_svg": f"{prefix}_carrier_envelope_curve.svg",
             "direct_dft_spectrum_svg": f"{prefix}_direct_dft_spectrum.svg",
             "envelope_dft_spectrum_svg": f"{prefix}_envelope_dft_spectrum.svg",
+            "carrier_envelope_dft_spectrum_svg": f"{prefix}_carrier_envelope_dft_spectrum.svg",
             "motion_spectrum_svg": f"{prefix}_motion_spectrum.svg",
             "ssa_aggregate_svg": f"{prefix}_ssa_aggregate.svg",
             "ssa_aggregate_spectrum_svg": f"{prefix}_ssa_aggregate_spectrum.svg",
