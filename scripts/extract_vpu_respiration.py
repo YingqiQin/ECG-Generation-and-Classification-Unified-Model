@@ -486,6 +486,8 @@ def dft_candidates_from_signal(
     for rank, peak in enumerate(peaks[:max_candidates]):
         dominance = peak_dominance_from_dft(dft, candidate_cpm=peak["bpm"])
         seed = math.log10(max(peak["power"], 1.0)) + min(dominance, 6.0)
+        lower_edge_distance_cpm = peak["bpm"] - cpm_min
+        upper_edge_distance_cpm = cpm_max - peak["bpm"]
         candidates.append(
             make_candidate(
                 source,
@@ -498,6 +500,8 @@ def dft_candidates_from_signal(
                     "autocorr_cpm": autocorr.get("candidate_bpm"),
                     "autocorr_strength": autocorr.get("autocorrelation"),
                     "peak_count_cpm": peak_count.get("candidate_cpm"),
+                    "lower_edge_distance_cpm": lower_edge_distance_cpm,
+                    "upper_edge_distance_cpm": upper_edge_distance_cpm,
                 },
             )
         )
@@ -512,6 +516,15 @@ def score_candidate(candidate: dict, motion_profile: dict, preset: str, motion_m
     score = candidate["score_seed"]
     reasons: list[str] = []
     cpm = candidate["candidate_cpm"]
+    lower_edge_distance = candidate.get("lower_edge_distance_cpm")
+
+    if lower_edge_distance is not None and lower_edge_distance < 2.0:
+        if candidate["source"] in {"direct", "envelope"}:
+            score -= 4.0
+            reasons.append("near_lower_bound_penalty")
+        elif candidate["source"].startswith("ssa"):
+            score -= 2.0
+            reasons.append("near_lower_bound_penalty")
 
     if candidate["source"] == "direct":
         if preset == "motion":
@@ -625,6 +638,14 @@ def combine_scored_candidates(scored: list[dict], preset: str, tolerance_cpm: fl
         group["support_families"] = sorted(family_scores)
         group["support_count"] = len(group["support_families"])
         group["combined_score"] = sum(family_scores.values()) + 1.5 * max(group["support_count"] - 1, 0)
+        lower_edge_distances = [
+            member.get("lower_edge_distance_cpm")
+            for member in group["members"]
+            if member.get("lower_edge_distance_cpm") is not None
+        ]
+        group["min_lower_edge_distance_cpm"] = min(lower_edge_distances) if lower_edge_distances else None
+        if group["min_lower_edge_distance_cpm"] is not None and group["min_lower_edge_distance_cpm"] < 2.0:
+            group["boundary_warning"] = "near_cpm_min"
         group["support_sources"] = sorted(set(group["support_sources"]))
         del group["score_weighted_total"]
         del group["weight_total"]
@@ -665,6 +686,10 @@ def select_final_candidate(groups: list[dict]) -> dict:
     confidence = clamp(0.18 * margin + 0.12 * best["support_count"] + 0.02 * best["combined_score"], 0.0, 1.0)
     status = "valid" if confidence >= 0.35 else "low_confidence"
     reject_reason = None if status == "valid" else "weak_candidate_margin_or_support"
+    if best.get("boundary_warning") == "near_cpm_min":
+        confidence = min(confidence, 0.34)
+        status = "low_confidence"
+        reject_reason = "candidate_near_cpm_min_boundary"
     return {
         "status": status,
         "rr_cpm": best["candidate_cpm"],
