@@ -8,7 +8,7 @@ win over plausible breathing components.
 
 Expected input shape: mono or multi-channel PCM16 WAV. If a file is
 multi-channel, channel 0 is used. The processing is non-causal because it
-analyzes full windows.
+analyzes the whole recording or full analysis windows.
 """
 
 from __future__ import annotations
@@ -54,16 +54,22 @@ def parse_args() -> argparse.Namespace:
         help="Target sample rate for respiration curves before CPM estimation",
     )
     parser.add_argument(
+        "--analysis-mode",
+        choices=["whole", "windows"],
+        default="whole",
+        help="Analyze the whole file once by default, or split long recordings into windows",
+    )
+    parser.add_argument(
         "--window-seconds",
         type=float,
         default=60.0,
-        help="Analysis window length in seconds",
+        help="Analysis window length in seconds when --analysis-mode windows is used",
     )
     parser.add_argument(
         "--hop-seconds",
         type=float,
         default=30.0,
-        help="Hop length between analysis windows in seconds",
+        help="Hop length between analysis windows when --analysis-mode windows is used",
     )
     parser.add_argument(
         "--cpm-min",
@@ -565,8 +571,12 @@ def combine_scored_candidates(scored: list[dict], tolerance_cpm: float = 2.5) ->
         for direct_group in direct_groups:
             direct_cpm = direct_group["candidate_cpm"]
             if abs(group["candidate_cpm"] - 2.0 * direct_cpm) <= tolerance_cpm:
-                group["combined_score"] -= 45.0
+                group["combined_score"] -= 55.0
                 group["harmonic_penalty"] = "near_double_direct_candidate"
+                break
+            if 0.0 < group["candidate_cpm"] - direct_cpm <= tolerance_cpm * 2.0:
+                group["combined_score"] -= 8.0
+                group["harmonic_penalty"] = "near_upper_neighbor_of_direct_candidate"
                 break
 
     groups.sort(key=lambda item: item["combined_score"], reverse=True)
@@ -807,6 +817,18 @@ def build_windows(signal: list[float], sample_rate_hz: float, window_seconds: fl
     return windows
 
 
+def build_analysis_segments(
+    signal: list[float],
+    sample_rate_hz: float,
+    analysis_mode: str,
+    window_seconds: float,
+    hop_seconds: float,
+) -> list[tuple[int, list[float]]]:
+    if analysis_mode == "whole":
+        return [(0, signal)]
+    return build_windows(signal, sample_rate_hz, window_seconds, hop_seconds)
+
+
 def make_trend_svg(windows: list[dict], out_path: Path, expected_cpm: float | None) -> None:
     width = 1200
     height = 320
@@ -1016,7 +1038,7 @@ def main() -> None:
         raise SystemExit("--cpm-min must be positive.")
     if args.cpm_max <= args.cpm_min:
         raise SystemExit("--cpm-max must be greater than --cpm-min.")
-    if args.window_seconds <= 0.0 or args.hop_seconds <= 0.0:
+    if args.analysis_mode == "windows" and (args.window_seconds <= 0.0 or args.hop_seconds <= 0.0):
         raise SystemExit("--window-seconds and --hop-seconds must be positive.")
 
     out_dir = args.output_dir / args.wav_path.stem / "vpu_respiration"
@@ -1031,7 +1053,13 @@ def main() -> None:
 
     window_results = []
     for window_index, (start_sample, window_signal) in enumerate(
-        build_windows(analysis_signal, analysis_rate, args.window_seconds, args.hop_seconds)
+        build_analysis_segments(
+            analysis_signal,
+            analysis_rate,
+            args.analysis_mode,
+            args.window_seconds,
+            args.hop_seconds,
+        )
     ):
         window_results.append(
             analyze_window(
@@ -1057,6 +1085,7 @@ def main() -> None:
             "respiration_curve_rate_hz": args.respiration_rate,
             "cpm_search_min": args.cpm_min,
             "cpm_search_max": args.cpm_max,
+            "analysis_mode": args.analysis_mode,
             "window_seconds": args.window_seconds,
             "hop_seconds": args.hop_seconds,
             "preset": args.preset,
@@ -1074,6 +1103,7 @@ def main() -> None:
         "file_name": args.wav_path.name,
         "method": "respear_inspired_motion_aware_ssa",
         "preset": args.preset,
+        "analysis_mode": args.analysis_mode,
         "expected_cpm": args.expected_cpm,
         "file_prediction": file_prediction,
         "windows": compact_windows,
