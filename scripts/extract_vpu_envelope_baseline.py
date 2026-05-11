@@ -38,6 +38,7 @@ CONDITION_PRESETS: dict[str, dict[str, float]] = {
     "running": {"cpm_min": 14.0, "cpm_max": 55.0},
     "cycling": {"cpm_min": 14.0, "cpm_max": 55.0},
 }
+MOTION_CONDITIONS = {"motion", "running", "cycling"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -103,6 +104,30 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional reference CPM for evaluation only; not used for selecting the prediction",
     )
+    parser.add_argument(
+        "--competitive-peak-ratio",
+        type=float,
+        default=0.75,
+        help="A DFT local peak is considered competitive when its power is at least this fraction of the top peak",
+    )
+    parser.add_argument(
+        "--peak-merge-cpm",
+        type=float,
+        default=2.0,
+        help="Merge DFT local peaks within this CPM distance before ambiguity detection",
+    )
+    parser.add_argument(
+        "--stationary-min-peak-dominance",
+        type=float,
+        default=1.05,
+        help="Minimum top/runner-up DFT peak power ratio required for stationary captures",
+    )
+    parser.add_argument(
+        "--motion-min-peak-dominance",
+        type=float,
+        default=1.25,
+        help="Minimum top/runner-up DFT peak power ratio required for motion captures",
+    )
     return parser.parse_args()
 
 
@@ -126,13 +151,67 @@ def resolve_cpm_bounds(args: argparse.Namespace) -> tuple[float, float, str]:
     return cpm_min, cpm_max, source
 
 
-def peak_dominance(dft_estimate: dict) -> float:
-    peaks = dft_estimate.get("top_peaks") or []
-    if not peaks:
-        return 0.0
-    best = peaks[0].get("power", 0.0)
-    second = max((peak.get("power", 0.0) for peak in peaks[1:]), default=0.0)
-    return best / max(second, 1e-12)
+def summarize_dft_peaks(
+    dft_estimate: dict,
+    competitive_peak_ratio: float,
+    peak_merge_cpm: float,
+    max_peaks: int = 8,
+) -> dict:
+    """Summarize separated local DFT peaks for ambiguity detection."""
+    spectrum = dft_estimate.get("spectrum") or []
+    if not spectrum:
+        return {
+            "peaks": [],
+            "competitive_peaks": [],
+            "competitive_peak_count": 0,
+            "dominance_ratio": 0.0,
+        }
+
+    local_peaks = []
+    for idx, item in enumerate(spectrum):
+        power = item["power"]
+        left_power = spectrum[idx - 1]["power"] if idx > 0 else None
+        right_power = spectrum[idx + 1]["power"] if idx + 1 < len(spectrum) else None
+        if left_power is None:
+            is_peak = right_power is None or power >= right_power
+        elif right_power is None:
+            is_peak = power >= left_power
+        else:
+            is_peak = power >= left_power and power > right_power
+        if is_peak:
+            local_peaks.append(item)
+
+    if not local_peaks:
+        local_peaks = dft_estimate.get("top_peaks") or []
+
+    merged_peaks = []
+    for peak in sorted(local_peaks, key=lambda item: item["power"], reverse=True):
+        if all(abs(peak["bpm"] - existing["bpm"]) > peak_merge_cpm for existing in merged_peaks):
+            merged_peaks.append(dict(peak))
+        if len(merged_peaks) >= max_peaks:
+            break
+
+    if not merged_peaks:
+        return {
+            "peaks": [],
+            "competitive_peaks": [],
+            "competitive_peak_count": 0,
+            "dominance_ratio": 0.0,
+        }
+
+    top_power = max(merged_peaks[0]["power"], 1e-12)
+    for rank, peak in enumerate(merged_peaks, start=1):
+        peak["rank"] = rank
+        peak["relative_power"] = peak["power"] / top_power
+
+    competitive = [peak for peak in merged_peaks if peak["relative_power"] >= competitive_peak_ratio]
+    second_power = merged_peaks[1]["power"] if len(merged_peaks) > 1 else 0.0
+    return {
+        "peaks": merged_peaks,
+        "competitive_peaks": competitive,
+        "competitive_peak_count": len(competitive),
+        "dominance_ratio": top_power / max(second_power, 1e-12),
+    }
 
 
 def make_cpm_spectrum_svg(
@@ -194,6 +273,11 @@ def build_vpu_envelope_baseline(
     carrier_high_hz: float,
     cpm_min: float,
     cpm_max: float,
+    condition: str,
+    competitive_peak_ratio: float,
+    peak_merge_cpm: float,
+    stationary_min_peak_dominance: float,
+    motion_min_peak_dominance: float,
     out_dir: Path,
     fragment_seconds: float,
 ) -> dict:
@@ -218,7 +302,8 @@ def build_vpu_envelope_baseline(
 
     autocorr_est = estimate_autocorr_bpm(breath_curve, envelope_rate, bpm_min=cpm_min, bpm_max=cpm_max)
     dft_est = estimate_dft_bpm(breath_curve, envelope_rate, bpm_min=cpm_min, bpm_max=cpm_max)
-    dominance = peak_dominance(dft_est)
+    peak_summary = summarize_dft_peaks(dft_est, competitive_peak_ratio, peak_merge_cpm)
+    dominance = peak_summary["dominance_ratio"]
     dft_cpm = dft_est.get("candidate_bpm")
     autocorr_cpm = autocorr_est.get("candidate_bpm")
     autocorr_delta = abs(dft_cpm - autocorr_cpm) if dft_cpm is not None and autocorr_cpm is not None else None
@@ -226,10 +311,17 @@ def build_vpu_envelope_baseline(
     confidence = min(1.0, 0.35 + 0.18 * min(dominance, 3.0))
     status = "valid"
     warnings: list[str] = []
+    min_required_dominance = motion_min_peak_dominance if condition in MOTION_CONDITIONS else stationary_min_peak_dominance
     if dft_cpm is None:
         status = "rejected"
         confidence = 0.0
         warnings.append("no_dft_candidate")
+    elif peak_summary["competitive_peak_count"] > 1 and dominance < min_required_dominance:
+        status = "ambiguous"
+        confidence = min(confidence, 0.40)
+        warnings.append("multiple_competing_dft_peaks")
+        if condition in MOTION_CONDITIONS:
+            warnings.append("motion_artifact_may_dominate_envelope")
     if dft_cpm is not None and dft_cpm - cpm_min < 2.0:
         warnings.append("candidate_near_cpm_min_check_condition_prior")
         confidence = min(confidence, 0.55)
@@ -238,6 +330,8 @@ def build_vpu_envelope_baseline(
     elif autocorr_delta is not None:
         warnings.append("autocorr_disagrees_with_dft")
         confidence = min(confidence, 0.72)
+    if status == "ambiguous":
+        confidence = min(confidence, 0.45)
 
     make_series_svg(bandpassed, out_dir / "vpu_carrier_bandpassed_waveform.svg", 1200, 280, "VPU carrier-band waveform")
     make_series_svg(envelope_ds, out_dir / "vpu_hilbert_envelope.svg", 1200, 280, "VPU Hilbert envelope")
@@ -273,6 +367,8 @@ def build_vpu_envelope_baseline(
         "dft_estimate": dft_est,
         "autocorr_estimate": autocorr_est,
         "dft_peak_dominance_ratio": dominance,
+        "dft_peak_summary": peak_summary,
+        "min_required_peak_dominance_ratio": min_required_dominance,
         "autocorr_delta_cpm": autocorr_delta,
         "status": status,
         "confidence": confidence,
@@ -295,6 +391,12 @@ def main() -> None:
         raise SystemExit("--envelope-rate must be positive.")
     if args.fragment_seconds <= 0.0:
         raise SystemExit("--fragment-seconds must be positive.")
+    if not (0.0 < args.competitive_peak_ratio <= 1.0):
+        raise SystemExit("--competitive-peak-ratio must be in (0, 1].")
+    if args.peak_merge_cpm <= 0.0:
+        raise SystemExit("--peak-merge-cpm must be positive.")
+    if args.stationary_min_peak_dominance < 1.0 or args.motion_min_peak_dominance < 1.0:
+        raise SystemExit("--stationary-min-peak-dominance and --motion-min-peak-dominance must be at least 1.")
 
     cpm_min, cpm_max, cpm_bound_source = resolve_cpm_bounds(args)
     if not (0.0 < args.carrier_low_hz < args.carrier_high_hz):
@@ -321,25 +423,46 @@ def main() -> None:
         args.carrier_high_hz,
         cpm_min,
         cpm_max,
+        args.condition,
+        args.competitive_peak_ratio,
+        args.peak_merge_cpm,
+        args.stationary_min_peak_dominance,
+        args.motion_min_peak_dominance,
         out_dir,
         args.fragment_seconds,
     )
 
     predicted_cpm = baseline["dft_estimate"].get("candidate_bpm")
-    error_vs_expected = predicted_cpm - args.expected_cpm if predicted_cpm is not None and args.expected_cpm is not None else None
+    final_breath_cpm = predicted_cpm if baseline["status"] == "valid" else None
+    error_vs_expected = (
+        final_breath_cpm - args.expected_cpm
+        if final_breath_cpm is not None and args.expected_cpm is not None
+        else None
+    )
+    top_candidate_error_vs_expected = (
+        predicted_cpm - args.expected_cpm
+        if predicted_cpm is not None and args.expected_cpm is not None
+        else None
+    )
     final_prediction = {
         "status": baseline["status"],
-        "breath_cpm": predicted_cpm,
+        "breath_cpm": final_breath_cpm,
+        "top_candidate_cpm": predicted_cpm,
         "confidence": baseline["confidence"],
         "condition": args.condition,
         "cpm_bound_source": cpm_bound_source,
         "cpm_search_min": cpm_min,
         "cpm_search_max": cpm_max,
         "dft_peak_dominance_ratio": baseline["dft_peak_dominance_ratio"],
+        "min_required_peak_dominance_ratio": baseline["min_required_peak_dominance_ratio"],
+        "competitive_peak_count": baseline["dft_peak_summary"]["competitive_peak_count"],
+        "competitive_peaks": baseline["dft_peak_summary"]["competitive_peaks"],
+        "top_peaks": baseline["dft_peak_summary"]["peaks"],
         "autocorr_cpm": baseline["autocorr_estimate"].get("candidate_bpm"),
         "autocorr_delta_cpm": baseline["autocorr_delta_cpm"],
         "expected_cpm": args.expected_cpm,
         "error_vs_expected_cpm": error_vs_expected,
+        "top_candidate_error_vs_expected_cpm": top_candidate_error_vs_expected,
         "warnings": baseline["warnings"],
     }
 
@@ -379,6 +502,16 @@ def main() -> None:
     print(f"Saved compact prediction to {out_dir / 'prediction.json'}")
     if predicted_cpm is None:
         print("FINAL_VPU_CPM rejected confidence=0.000")
+    elif baseline["status"] == "ambiguous":
+        candidates = ",".join(f"{peak['bpm']:.1f}" for peak in baseline["dft_peak_summary"]["competitive_peaks"])
+        print(
+            "FINAL_VPU_CPM ambiguous "
+            f"top_candidate={predicted_cpm:.2f} "
+            f"confidence={baseline['confidence']:.3f} "
+            f"condition={args.condition} "
+            f"range={cpm_min:.1f}-{cpm_max:.1f} "
+            f"competitive_candidates={candidates}"
+        )
     else:
         print(
             "FINAL_VPU_CPM "
