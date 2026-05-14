@@ -3,8 +3,13 @@ import json
 from collections import Counter
 from pathlib import Path
 from typing import Dict, List
+from zipfile import ZipFile
+import xml.etree.ElementTree as ET
 
 import pandas as pd
+
+
+XLSX_NS = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 
 
 def _normalize_flag(value) -> int:
@@ -18,6 +23,95 @@ def _normalize_flag(value) -> int:
 
 def _value_distribution(series: pd.Series) -> Dict[str, int]:
     return {str(k): int(v) for k, v in Counter(series.astype(str).tolist()).items()}
+
+
+def _xlsx_col_index(cell_ref: str) -> int:
+    letters = "".join(ch for ch in cell_ref if ch.isalpha())
+    idx = 0
+    for ch in letters:
+        idx = idx * 26 + (ord(ch.upper()) - 64)
+    return idx - 1
+
+
+def _read_xlsx_first_sheet(path: Path) -> pd.DataFrame:
+    try:
+        return pd.read_excel(path)
+    except ImportError:
+        pass
+
+    with ZipFile(path) as zf:
+        shared_strings = []
+        shared_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+        for si in shared_root.findall("a:si", XLSX_NS):
+            shared_strings.append("".join(t.text or "" for t in si.findall(".//a:t", XLSX_NS)))
+
+        sheet_root = ET.fromstring(zf.read("xl/worksheets/sheet1.xml"))
+        rows = []
+        for row in sheet_root.findall(".//a:sheetData/a:row", XLSX_NS):
+            values = {}
+            for cell in row.findall("a:c", XLSX_NS):
+                idx = _xlsx_col_index(cell.attrib.get("r", ""))
+                value_node = cell.find("a:v", XLSX_NS)
+                if value_node is None:
+                    value = ""
+                elif cell.attrib.get("t") == "s":
+                    value = shared_strings[int(value_node.text)]
+                else:
+                    value = value_node.text
+                values[idx] = value
+            if values:
+                rows.append([values.get(i, "") for i in range(max(values) + 1)])
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows[1:], columns=rows[0])
+
+
+def _enrich_taizhou_surgery_flags(df: pd.DataFrame, xlsx_path: Path) -> Dict[str, object]:
+    df["TZ_手术名单"] = 0
+    df["TZ_手术类型"] = ""
+
+    info: Dict[str, object] = {
+        "xlsx_path": str(xlsx_path),
+        "xlsx_exists": bool(xlsx_path.exists()),
+        "xlsx_rows": 0,
+        "matched_rows": 0,
+        "matched_unique_xml_files": 0,
+        "unmatched_xml_files": [],
+    }
+    if not xlsx_path.exists():
+        return info
+
+    surgery_df = _read_xlsx_first_sheet(xlsx_path)
+    required_cols = {"xml文件名", "是否手术", "手术类型"}
+    missing_cols = sorted(required_cols - set(surgery_df.columns))
+    if missing_cols:
+        raise ValueError(
+            "Taizhou surgery workbook is missing required columns: {}.".format(", ".join(missing_cols))
+        )
+
+    surgery_df = surgery_df.copy()
+    surgery_df["xml文件名"] = surgery_df["xml文件名"].astype(str).str.strip()
+    surgery_df["是否手术"] = pd.to_numeric(surgery_df["是否手术"], errors="coerce").fillna(0).astype(int)
+    surgery_df = surgery_df[(surgery_df["xml文件名"] != "") & (surgery_df["是否手术"] == 1)].copy()
+    surgery_map = dict(zip(surgery_df["xml文件名"], surgery_df["手术类型"].fillna("").astype(str)))
+
+    xml_values = df["xml_file"].astype(str)
+    match_mask = xml_values.isin(surgery_map)
+    df.loc[match_mask, "TZ_手术名单"] = 1
+    df.loc[match_mask, "TZ_手术类型"] = xml_values[match_mask].map(surgery_map).fillna("")
+
+    manifest_files = set(xml_values.tolist())
+    unmatched = sorted(set(surgery_map) - manifest_files)
+    info.update(
+        {
+            "xlsx_rows": int(len(surgery_df)),
+            "matched_rows": int(match_mask.sum()),
+            "matched_unique_xml_files": int(xml_values[match_mask].nunique()),
+            "unmatched_xml_files": unmatched[:20],
+        }
+    )
+    return info
 
 
 def _apply_spec_mask(df: pd.DataFrame, spec: Dict) -> pd.Series:
@@ -143,6 +237,76 @@ def _subtask_specs() -> Dict[str, Dict]:
             "negative_class_bnp_lt": 300.0,
             "exclude_if_bnp_gt": 30000.0,
         },
+        "taizhou_surgery_clean": {
+            "description": "Exclude Taizhou XML rows listed in the latest doctor-designated surgery workbook. Shengrenyi rows are unchanged in this subset.",
+            "exclude_if_any": [
+                "TZ_手术名单",
+            ],
+        },
+        "doc_error_reduced_taizhou_surgery_clean": {
+            "description": "Apply the existing Shengrenyi doc_error_reduced exclusions and also remove Taizhou surgery-list rows.",
+            "exclude_if_any": [
+                "is_problem",
+                "L_一_1_大血管_瓣膜_冠脉手术",
+                "L_一_2_起搏大类",
+                "L_二_2_左心重度狭窄瓣膜病",
+                "L_三_1_梗死史",
+                "L_四_1_束支阻滞",
+                "L_二_6_心室肥厚",
+                "L_四_4_床旁重症",
+                "TZ_手术名单",
+            ],
+        },
+        "low_interference_taizhou_surgery_clean": {
+            "description": "Apply the existing Shengrenyi low_interference exclusions and also remove Taizhou surgery-list rows.",
+            "exclude_if_any": [
+                "is_problem",
+                "L_一_1_大血管_瓣膜_冠脉手术",
+                "L_一_2_起搏大类",
+                "L_一_3_消融术后",
+                "L_一_4_左心耳干预",
+                "L_四_1_束支阻滞",
+                "L_四_3_大量心包积液",
+                "L_四_4_床旁重症",
+                "TZ_手术名单",
+            ],
+        },
+        "cardiac_clean_taizhou_surgery_clean": {
+            "description": "Apply the existing Shengrenyi cardiac_clean exclusions and also remove Taizhou surgery-list rows.",
+            "exclude_if_any": [
+                "is_problem",
+                "L_一_1_大血管_瓣膜_冠脉手术",
+                "L_一_2_起搏大类",
+                "L_一_3_消融术后",
+                "L_一_4_左心耳干预",
+                "L_四_1_束支阻滞",
+                "L_四_3_大量心包积液",
+                "L_四_4_床旁重症",
+                "L_二_3_右心大_肺动脉高压",
+                "L_二_4_右心重度瓣膜病",
+                "L_二_5_仅右房增大",
+                "TZ_手术名单",
+            ],
+        },
+        "left_ventricular_clean_taizhou_surgery_clean": {
+            "description": "Apply the existing Shengrenyi left_ventricular_clean exclusions and also remove Taizhou surgery-list rows.",
+            "exclude_if_any": [
+                "is_problem",
+                "L_一_1_大血管_瓣膜_冠脉手术",
+                "L_一_2_起搏大类",
+                "L_一_3_消融术后",
+                "L_一_4_左心耳干预",
+                "L_四_1_束支阻滞",
+                "L_四_3_大量心包积液",
+                "L_四_4_床旁重症",
+                "L_二_3_右心大_肺动脉高压",
+                "L_二_4_右心重度瓣膜病",
+                "L_二_5_仅右房增大",
+                "L_三_1_梗死史",
+                "L_二_6_心室肥厚",
+                "TZ_手术名单",
+            ],
+        },
         "doc_error_reduced_doctor_bnp_negative_pure_extreme_30000": {
             "description": "Combine doc_error_reduced with the practical doctor BNP rule: class 0 requires BNP < 300 and very extreme BNP > 30000 is excluded.",
             "exclude_if_any": [
@@ -160,6 +324,24 @@ def _subtask_specs() -> Dict[str, Dict]:
             "negative_class_bnp_lt": 300.0,
             "exclude_if_bnp_gt": 30000.0,
         },
+        "doc_error_reduced_taizhou_surgery_doctor_bnp_negative_pure_extreme_30000": {
+            "description": "Combine doc_error_reduced, Taizhou surgery-list exclusion, and the practical doctor BNP rule.",
+            "exclude_if_any": [
+                "is_problem",
+                "L_一_1_大血管_瓣膜_冠脉手术",
+                "L_一_2_起搏大类",
+                "L_二_2_左心重度狭窄瓣膜病",
+                "L_三_1_梗死史",
+                "L_四_1_束支阻滞",
+                "L_二_6_心室肥厚",
+                "L_四_4_床旁重症",
+                "TZ_手术名单",
+            ],
+            "bnp_col": "bnp_value",
+            "negative_class_value": 0,
+            "negative_class_bnp_lt": 300.0,
+            "exclude_if_bnp_gt": 30000.0,
+        },
         "low_interference_doctor_bnp_negative_pure_extreme_30000": {
             "description": "Combine low_interference with the practical doctor BNP rule: class 0 requires BNP < 300 and very extreme BNP > 30000 is excluded.",
             "exclude_if_any": [
@@ -171,6 +353,24 @@ def _subtask_specs() -> Dict[str, Dict]:
                 "L_四_1_束支阻滞",
                 "L_四_3_大量心包积液",
                 "L_四_4_床旁重症",
+            ],
+            "bnp_col": "bnp_value",
+            "negative_class_value": 0,
+            "negative_class_bnp_lt": 300.0,
+            "exclude_if_bnp_gt": 30000.0,
+        },
+        "low_interference_taizhou_surgery_doctor_bnp_negative_pure_extreme_30000": {
+            "description": "Combine low_interference, Taizhou surgery-list exclusion, and the practical doctor BNP rule.",
+            "exclude_if_any": [
+                "is_problem",
+                "L_一_1_大血管_瓣膜_冠脉手术",
+                "L_一_2_起搏大类",
+                "L_一_3_消融术后",
+                "L_一_4_左心耳干预",
+                "L_四_1_束支阻滞",
+                "L_四_3_大量心包积液",
+                "L_四_4_床旁重症",
+                "TZ_手术名单",
             ],
             "bnp_col": "bnp_value",
             "negative_class_value": 0,
@@ -197,6 +397,27 @@ def _subtask_specs() -> Dict[str, Dict]:
             "negative_class_bnp_lt": 300.0,
             "exclude_if_bnp_gt": 30000.0,
         },
+        "cardiac_clean_taizhou_surgery_doctor_bnp_negative_pure_extreme_30000": {
+            "description": "Combine cardiac_clean, Taizhou surgery-list exclusion, and the practical doctor BNP rule.",
+            "exclude_if_any": [
+                "is_problem",
+                "L_一_1_大血管_瓣膜_冠脉手术",
+                "L_一_2_起搏大类",
+                "L_一_3_消融术后",
+                "L_一_4_左心耳干预",
+                "L_四_1_束支阻滞",
+                "L_四_3_大量心包积液",
+                "L_四_4_床旁重症",
+                "L_二_3_右心大_肺动脉高压",
+                "L_二_4_右心重度瓣膜病",
+                "L_二_5_仅右房增大",
+                "TZ_手术名单",
+            ],
+            "bnp_col": "bnp_value",
+            "negative_class_value": 0,
+            "negative_class_bnp_lt": 300.0,
+            "exclude_if_bnp_gt": 30000.0,
+        },
         "left_ventricular_clean_doctor_bnp_negative_pure_extreme_30000": {
             "description": "Combine left_ventricular_clean with the practical doctor BNP rule: class 0 requires BNP < 300 and very extreme BNP > 30000 is excluded.",
             "exclude_if_any": [
@@ -213,6 +434,29 @@ def _subtask_specs() -> Dict[str, Dict]:
                 "L_二_5_仅右房增大",
                 "L_三_1_梗死史",
                 "L_二_6_心室肥厚",
+            ],
+            "bnp_col": "bnp_value",
+            "negative_class_value": 0,
+            "negative_class_bnp_lt": 300.0,
+            "exclude_if_bnp_gt": 30000.0,
+        },
+        "left_ventricular_clean_taizhou_surgery_doctor_bnp_negative_pure_extreme_30000": {
+            "description": "Combine left_ventricular_clean, Taizhou surgery-list exclusion, and the practical doctor BNP rule.",
+            "exclude_if_any": [
+                "is_problem",
+                "L_一_1_大血管_瓣膜_冠脉手术",
+                "L_一_2_起搏大类",
+                "L_一_3_消融术后",
+                "L_一_4_左心耳干预",
+                "L_四_1_束支阻滞",
+                "L_四_3_大量心包积液",
+                "L_四_4_床旁重症",
+                "L_二_3_右心大_肺动脉高压",
+                "L_二_4_右心重度瓣膜病",
+                "L_二_5_仅右房增大",
+                "L_三_1_梗死史",
+                "L_二_6_心室肥厚",
+                "TZ_手术名单",
             ],
             "bnp_col": "bnp_value",
             "negative_class_value": 0,
@@ -285,12 +529,19 @@ def build_argparser() -> argparse.ArgumentParser:
         default="hf_manifest_combined_20260322",
         help="Filename prefix for generated subtask manifests.",
     )
+    parser.add_argument(
+        "--taizhou-surgery-xlsx",
+        type=Path,
+        default=Path("data/泰州900例_手术名单.xlsx"),
+        help="Doctor-designated Taizhou surgery workbook.",
+    )
     return parser
 
 
 def main() -> None:
     args = build_argparser().parse_args()
     df = pd.read_csv(args.manifest_csv)
+    taizhou_surgery_info = _enrich_taizhou_surgery_flags(df, args.taizhou_surgery_xlsx)
     available_cols = set(df.columns)
 
     flag_cols = [col for col in df.columns if col == "is_problem" or col.startswith("L_")]
@@ -306,6 +557,7 @@ def main() -> None:
         "base_manifest": str(args.manifest_csv),
         "base_rows": int(len(df)),
         "base_class_distribution": _value_distribution(df["class"]),
+        "taizhou_surgery_info": taizhou_surgery_info,
         "subtasks": {},
     }
 
